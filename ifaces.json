@@ -1,0 +1,60 @@
+{
+ "hash": "9e16b8cefb40833f36ed0b5e0a87117412e373e3fd783b2a14ef095bffb7debb",
+ "ifaces": {
+  "@penguinharness/ontology-rsi-toolkit#OntologyRsiToolkitPlugin": {
+   "name": "OntologyRsiToolkitPlugin",
+   "methods": {},
+   "slots": {}
+  }
+ },
+ "types": {},
+ "modules": {
+  "OntologyRsiToolkitPlugin": {
+   "name": "OntologyRsiToolkitPlugin",
+   "kind": "component",
+   "requires": {},
+   "provides": {
+    "OntologyRsiToolkitPlugin": "@penguinharness/ontology-rsi-toolkit#OntologyRsiToolkitPlugin"
+   },
+   "contributes": {
+    "PluginLibraryModule.cards": [
+     {
+      "id": "ontology-rsi-toolkit.card",
+      "title": "Ontology RSI Toolkit",
+      "titleZh": "本体自进化工具包",
+      "descriptionZh": "本体 RSI 工具包：从 Agent 自己的执行轨迹中学习其工作领域的类型化模型（实体、关系、生命周期、数据源优先级、动作契约、约束），每条修改都须逐字引用轨迹并通过确定性校验，冻结后在独立测试上评测。",
+      "shortDescription": "Ontology RSI Toolkit: learn a typed domain model from Traces.",
+      "shortDescriptionZh": "本体 RSI 工具包：从轨迹中学习类型化的领域模型。",
+      "category": "rsi",
+      "icon": "icon.svg",
+      "preinstall": false,
+      "quickStart": {
+       "prompt": "Use the Ontology RSI Toolkit on the selected Project Benchmarks with the requested model and budget.",
+       "promptZh": "使用本体 RSI 工具包，按指定模型和预算完成选定 Project Benchmark 的实验。",
+       "skills": [
+        "ontology-rsi-toolkit"
+       ]
+      },
+      "references": [
+       "https://github.com/EonHao/ontology-rsi-toolkit/blob/main/DESIGN.md"
+      ]
+     }
+    ],
+    "PluginLibraryModule.skills": [
+     {
+      "id": "ontology-rsi-toolkit.skill.ontology-rsi-toolkit",
+      "name": "ontology-rsi-toolkit",
+      "path": "skills/ontology-rsi-toolkit"
+     }
+    ]
+   },
+   "children": []
+  }
+ },
+ "plugin": {
+  "modules": [
+   "OntologyRsiToolkitPlugin"
+  ],
+  "replaces": []
+ }
+}

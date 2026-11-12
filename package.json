@@ -1,0 +1,42 @@
+{
+  "name": "@penguinharness/ontology-rsi-toolkit",
+  "version": "0.1.0",
+  "description": "The Ontology RSI Toolkit: learn a typed model of an agent's working domain (entities, relations, lifecycles, source precedence, action contracts, constraints) from its own Traces through evidence-gated edits, and measure the frozen model on held-out tasks.",
+  "keywords": [
+    "penguin-plugin",
+    "penguinharness",
+    "skills",
+    "ontology"
+  ],
+  "license": "Apache-2.0",
+  "author": {
+    "name": "EonHao",
+    "url": "https://github.com/EonHao"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/EonHao/ontology-rsi-toolkit.git"
+  },
+  "homepage": "https://github.com/EonHao/ontology-rsi-toolkit",
+  "type": "module",
+  "files": [
+    "icon.svg",
+    "skills",
+    "ifaces.json",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build": "node ${PENGUIN_HARNESS:-../penguin-harness}/scripts/gen-ifaces.mjs --project tsconfig.json --out ifaces.json",
+    "test": "node --test \"test/*.test.mjs\"",
+    "check": "node skills/ontology-rsi-toolkit/scripts/onto.mjs --help >/dev/null && node --test \"test/*.test.mjs\""
+  },
+  "devDependencies": {
+    "@prismshadow/penguin-core": ">=0.2.18",
+    "@types/node": "^24.0.0",
+    "typescript": "^5.9.0"
+  },
+  "packageManager": "pnpm@11.18.0",
+  "engines": {
+    "node": ">=24"
+  }
+}

@@ -1,0 +1,5 @@
+# Not a monorepo: the file exists for pnpm settings only.
+packages: []
+allowBuilds:
+  "@google/genai": false
+  protobufjs: false

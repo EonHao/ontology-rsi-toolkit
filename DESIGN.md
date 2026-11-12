@@ -222,14 +222,14 @@ flowchart LR
     class V gate
 ```
 
-1. **Extract** (script): pulls tool calls, outputs, errors and fetched records from the Trace. During training, it also attaches the per-case score that the judge returns.
-2. **Propose** (an LLM in the Ontologist role): returns typed edit operations: `ADD`, `REFINE`, `SCOPE`, `MERGE`, `RETIRE` and `SUPPORT`. Every operation must quote the Trace.
-3. **Probe** (optional): sends read-only queries to the business service to test a hypothesis.
+1. **Extract** (script): pulls the task input, tool calls, outputs and errors from the Actor's Trace into a corpus, and the judge's reply into a second corpus entry. The model's own text is logged for the Ontologist but never becomes evidence.
+2. **Propose** (the Ontologist): returns typed edit operations: `ADD`, `REFINE`, `SCOPE`, `MERGE`, `RETIRE` and `SUPPORT`. Every operation must quote the corpus.
+3. **Probe** (optional): sends read-only queries to the business service to test a hypothesis about structure. Probe quotes never count as task support.
 4. **Validate** (script): checks
    - the schema;
-   - referential integrity;
-   - that each quote appears verbatim in the Trace;
-   - that no instance or case ids appear;
+   - referential integrity, including `E.X`-style ids written in text;
+   - that each quote appears verbatim in the corpus of the Session it names;
+   - that no instance id appears in content. An instance id is a task label, an id the task's own input names, or a record id seen in one task only. A value seen across tasks is reference data of the domain (a policy code, a rate table) and may be named;
    - the token budget.
 5. **Publish**: applies the lifecycle rules below and updates support using `ontology-used.txt` and the score. It then bumps the Skill and State versions, takes a snapshot and appends to `CHANGELOG.md`.
 6. **Consolidate**: when the budget is exceeded, merges synonymous elements and drops the lowest-support candidates.
@@ -248,14 +248,20 @@ ontology-rsi-toolkit/
 ├── icon.svg
 ├── skills/ontology-rsi-toolkit/      # experiment controller, named after the plugin
 │   ├── SKILL.md
+│   ├── references/benchmark.md       # resolves the Train/Test packages and run contract
 │   ├── references/initialization.md  # creates the slot and the reader line
-│   ├── references/evaluation.md      # byte-identical to the shared toolkit reference
+│   ├── references/evaluation.md      # byte-identical to the shared container-training reference
 │   ├── references/training.md        # in-container continuous training (Harbor)
-│   ├── references/ontologist.md      # the Propose role
-│   └── scripts/onto.mjs              # Node built-ins only: validate, render, apply, extract, checklist, diff
+│   ├── references/ontologist.md      # the Propose role and the edit language
+│   └── scripts/onto.mjs              # Node built-ins only: init, extract, apply, validate, render, export, diff, stats
+├── test/                             # tests of onto.mjs
 ├── skills/ontology/                  # phase 2: everyday modelling for any agent
 └── hooks/                            # phase 2: stop.mjs, pre_tool_use.mjs
 ```
+
+The package does not ship `domain-ontology`. `onto.mjs init` creates it in the Target's State, so that reinstalling the plugin never touches what an agent has learned.
+
+Inside a training container the main session is the Ontologist. Each attempt runs in a fresh Actor session that sees only the public task and a frozen, provenance-free export of the slot. The default is two passes over the training tasks: pass 2 retries every task under the ontology learned in pass 1, which gives the improved-retry signal for promotion and the last training measurement. The exported checkpoint is the last published version.
 
 The card has category `rsi` and `preinstall: false`. Under PRFC-0019, the name and category are enough for the toolkit to appear in the Method dropdown and in the algorithm count on the draft page. No frontend change is needed.
 
@@ -330,7 +336,7 @@ Validate enforces this on every publish. Without it, the ontology cannot be audi
 
 ### No private scoring material
 
-> Nothing taken from a `rubric/`, a gold answer or a verifier's private output enters the refinement loop. The only score signal is the per-case score that the judge returns.
+> Nothing taken from a `rubric/`, a gold answer or a verifier's private output enters the refinement loop. The only feedback is what the training judge returns, its score and correctness feedback, which the benchmark exposes for training. The Actor never sees it.
 
 This is the information barrier that every toolkit keeps (*Self-Improvement › The information barrier*). If it is broken, the test scores mean nothing.
 

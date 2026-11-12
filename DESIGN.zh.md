@@ -186,10 +186,15 @@ flowchart LR
     class V gate
 ```
 
-1. **Extract**（脚本）：从 Trace 中抽出工具调用、输出、报错和查询到的记录。训练阶段还会附上 judge 返回的单题分数。
-2. **Propose**（LLM 扮演 Ontologist 角色）：输出类型化的修改操作，包括 `ADD`、`REFINE`、`SCOPE`、`MERGE`、`RETIRE`、`SUPPORT`。每条操作都必须引用 Trace 原文。
-3. **Probe**（可选）：向业务服务发送只读查询，验证某个假设。
-4. **Validate**（脚本）：检查 schema 和引用完整性，确认每条引用都能在 Trace 中逐字找到、修改中不含实例或案例的 id、没有超出 token 预算。
+1. **Extract**（脚本）：把 Actor Trace 中的任务输入、工具调用、输出和报错抽进证据库，judge 的回复也作为一条单独记录进入证据库。模型自己说的话只记入给 Ontologist 看的日志，永远不能当证据。
+2. **Propose**（Ontologist）：输出类型化的修改操作，包括 `ADD`、`REFINE`、`SCOPE`、`MERGE`、`RETIRE`、`SUPPORT`。每条操作都必须引用证据库原文。
+3. **Probe**（可选）：向业务服务发送只读查询，验证关于结构的假设。Probe 得到的引用不计入任务 support。
+4. **Validate**（脚本）：检查
+   - schema；
+   - 引用完整性，包括写在文本里的 `E.X` 形式的 id；
+   - 每条引用都能在其所注明 Session 的证据库中逐字找到；
+   - 内容中不含实例 id。实例 id 指：任务标签、任务输入中点名的 id，以及只在一个任务中出现过的记录 id。在多个任务中都出现的值属于领域的参考数据（如政策编号、费率表），可以出现；
+   - 没有超出 token 预算。
 5. **Publish**：按下表的生命周期规则合并修改，并根据 `ontology-used.txt` 和分数更新 support；随后提升 Skill 和 State 的版本号，打快照，并追加 `CHANGELOG.md`。
 6. **Consolidate**：超出预算时，合并同义元素，删除 support 最低的候选元素。
 
@@ -207,14 +212,20 @@ ontology-rsi-toolkit/
 ├── icon.svg
 ├── skills/ontology-rsi-toolkit/      # 实验控制器，与插件同名
 │   ├── SKILL.md
+│   ├── references/benchmark.md       # 解析 Train/Test 包和运行约定
 │   ├── references/initialization.md  # 创建学习槽和读取指令
-│   ├── references/evaluation.md      # 与其他工具包共享的评估说明，逐字相同
+│   ├── references/evaluation.md      # 与容器训练类工具包共享的评估说明，逐字相同
 │   ├── references/training.md        # 容器内连续训练（Harbor）
-│   ├── references/ontologist.md      # Propose 角色说明
-│   └── scripts/onto.mjs              # 只用 Node 内置模块：validate、render、apply、extract、checklist、diff
+│   ├── references/ontologist.md      # Propose 角色说明和修改语言
+│   └── scripts/onto.mjs              # 只用 Node 内置模块：init、extract、apply、validate、render、export、diff、stats
+├── test/                             # onto.mjs 的测试
 ├── skills/ontology/                  # 第二阶段：供任意 Agent 使用的日常建模 Skill
 └── hooks/                            # 第二阶段：stop.mjs、pre_tool_use.mjs
 ```
+
+包里不带 `domain-ontology`。它由 `onto.mjs init` 在 Target 的 State 中创建，所以重装插件永远不会碰到 Agent 已经学到的内容。
+
+训练容器里，主会话是 Ontologist。每次答题都在一个全新的 Actor 会话中进行，Actor 只能看到公开任务和学习槽的冻结副本（导出时去掉了出处信息）。默认对训练任务跑两遍：第二遍在第一遍学到的本体下重做每道题，既提供“重做后分数提高”的晋升信号，也是最后一次训练测量。导出的版本是最后一次发布的版本。
 
 card 的类别为 `rsi`，`preinstall` 设为 `false`。按照 PRFC-0019，只要名称和类别符合约定，工具包就会自动出现在 Method 下拉框中，并计入首页的算法数量，无需改动前端。
 
@@ -285,7 +296,7 @@ Validate 在每次发布时都会检查这一点。没有这条约束，本体�
 
 ### No private scoring material
 
-> 任何来自 `rubric/`、标准答案或评测器私有输出的内容，都不会进入精炼循环；唯一的分数信号是 judge 返回的单题分数。
+> 任何来自 `rubric/`、标准答案或评测器私有输出的内容，都不会进入精炼循环。唯一的反馈是训练 judge 返回的内容，即分数和对错反馈，这是 benchmark 明确开放给训练使用的。Actor 永远看不到它。
 
 这是所有工具包都遵守的信息隔离原则（*Self-Improvement › The information barrier*）。一旦被打破，测试分数就失去了意义。
 
