@@ -72,7 +72,7 @@ The brief gives the public task and input paths, API and tool access, the judge 
     "body": { "task_id": "{task}", "answer": "{answer}" },
     "score_path": "score",
     "scale": 100,
-    "budget_per_task": 150
+    "budget_per_task": 300
   },
   "actor": {
     "agent_id": "<actor id>",

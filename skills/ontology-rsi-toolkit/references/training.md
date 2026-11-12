@@ -68,7 +68,7 @@ SCRIPT localize --task <t> --answer WORK/attempts/<t>-baseline.json --config CON
 SCRIPT gaps --work WORK
 ```
 
-`localize` removes one answer field at a time and asks the judge again. A field whose removal costs points earned credit; a field whose removal changes nothing earned none: it is wrong, or it is scored only together with others. `gaps` lists the fields without credit, the ones that recur across the most tasks first. Work in that order. A gap shared by many tasks is a fact about the domain and will meet the next task too; a gap in one task may be that task's own.
+`localize` removes one answer field at a time and asks the judge again; in a list of records it goes record by record (`rows[2].status`). A field whose removal costs points earned credit; a field whose removal changes nothing earned none: it is wrong, it is not scored, or it is scored only together with others. For true/false fields the script settles which: it flips the value, and reports the field as `wrong` if the score rises and `unscored` if nothing moves. `gaps` drops the unscored fields and lists the rest under one path per field (`rows.status`), the ones that recur across the most tasks first, with how often the field was proved wrong and how often the same field earned credit elsewhere, which shows that it is scored at all. Work in that order. A gap shared by many tasks is a fact about the domain and will meet the next task too; a gap in one task may be that task's own.
 
 Then record the structure the Actors relied on (`ontologist.md`, *Structure*) with one `apply`. Keep it lean: the records and fields the gaps touch, and the sources an Actor wasted calls finding.
 

@@ -18,14 +18,14 @@ Read [benchmark.md](references/benchmark.md) to discover the selected Project's 
 | --- | --- |
 | Independent training runs per benchmark/training unit | 1 |
 | Actor attempts per task | 2: one `baseline` on the empty slot, one `verify` on the learned one |
-| Judge calls per task (distinct answers) | 150 |
+| Judge calls per task (distinct answers) | 300 |
 | Ontology token budget (rendered view) | 6000 |
 | Checkpoint selection | `final`: the last published ontology |
 | Test conditions | Baseline and the final ontology |
 | Complete test repetitions per condition | 3 |
 | Harbor trial concurrency | 4, shared across owned training and testing jobs |
 
-These are toolkit choices, not constants of a paper. Fix the configuration before learning. Use sorted public task ids unless another order is supplied. Five tasks mean 10 fresh Actor sessions in one training run, and at most 750 judge calls, none of which runs a model. Five held-out tasks and three repetitions mean 15 test trials per condition, 30 with the baseline. When the experiment reuses a published baseline, record its source, State digest and versions and confirm they match this experiment's runtime and task commit; otherwise measure it.
+These are toolkit choices, not constants of a paper. Fix the configuration before learning. Use sorted public task ids unless another order is supplied. Five tasks mean 10 fresh Actor sessions in one training run, and at most 1,500 judge calls, none of which runs a model. Five held-out tasks and three repetitions mean 15 test trials per condition, 30 with the baseline. When the experiment reuses a published baseline, record its source, State digest and versions and confirm they match this experiment's runtime and task commit; otherwise measure it.
 
 The method needs a training judge that scores a submitted answer on request. Where the benchmark offers none, say so and stop; do not substitute whole reruns for experiments.
 

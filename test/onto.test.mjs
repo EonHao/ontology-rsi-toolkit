@@ -331,9 +331,47 @@ test("localize finds the fields without credit; gaps ranks the ones that recur a
   assert.deepEqual(l1.no_credit, ["decision", "audit.rule", "audit.order"]);
   await localize(fx.work, CFG, "train_002", BASE.train_002, ask);
   const g = gaps(fx.work);
-  assert.deepEqual(g.gaps[0], { path: "audit.order", tasks: ["train_001", "train_002"] });
-  assert.deepEqual(g.gaps[1], { path: "audit.rule", tasks: ["train_001", "train_002"] });
-  assert.deepEqual(g.gaps[2], { path: "decision", tasks: ["train_001"] });
+  assert.deepEqual(g.gaps.map((x) => [x.path, x.tasks.length]), [["audit.order", 2], ["audit.rule", 2], ["decision", 1]]);
+  assert.equal(g.gaps[2].credited, 1, "decision earns credit in the other task, so it is a scored field");
+});
+
+test("lists of records are localized record by record, and a rule about a field covers every record", async () => {
+  const fx = fixture();
+  const gold = { rows: [{ id: "a", route: "x" }, { id: "b", route: "y" }], tags: ["p", "q"] };
+  const askRows = async (_c, _t, answer) => {
+    let right = 0;
+    (answer.rows || []).forEach((r, i) => {
+      if (r.id === gold.rows[i]?.id) right += 1;
+      if (r.route === gold.rows[i]?.route) right += 1;
+    });
+    return { score: right / 4 };
+  };
+  const answer = { rows: [{ id: "a", route: "x" }, { id: "b", route: "WRONG" }], tags: ["p", "q"] };
+  assert.deepEqual([...leafPaths(answer).keys()], ["rows[0].id", "rows[0].route", "rows[1].id", "rows[1].route", "tags"]);
+  const l = await localize(fx.work, CFG, "t", answer, askRows);
+  assert.equal(l.score, 75);
+  assert.deepEqual(l.credited.map((c) => c.path), ["rows[0].id", "rows[0].route", "rows[1].id"]);
+  assert.deepEqual(l.no_credit, ["rows[1].route", "tags"]);
+  // A true/false field without credit is flipped: wrong if the score rises, unscored if nothing moves.
+  const askFlags = async (_c, _t, a) => ({ score: (a.urgent === true ? 0.5 : 0) + (a.name === "n" ? 0.5 : 0) });
+  const lf = await localize(fx.work, CFG, "flags", { urgent: false, internal: true, name: "n" }, askFlags);
+  assert.deepEqual(lf.wrong, [{ path: "urgent", delta: 50 }]);
+  assert.deepEqual(lf.unscored, ["internal"]);
+  assert.deepEqual(gaps(fx.work).gaps.find((x) => x.path === "urgent").wrong, 1);
+  assert.equal(gaps(fx.work).gaps.some((x) => x.path === "internal"), false, "unscored fields are not gaps");
+  const fixed = { ...answer, rows: [answer.rows[0], { id: "b", route: "y" }] };
+  assert.deepEqual(changedPaths(answer, fixed), ["rows[1].route"]);
+  // decides: ["rows.route"] covers rows[1].route; an experiment that also touched rows[1].id would be refused.
+  initSlot(fx.slot, { date: DATE });
+  const corpus = extractAll(fx);
+  const rule = { id: "C.route", kind: "constraint", decides: ["rows.route"], rule: "route follows the record's plan" };
+  assert.equal(applyEdits(fx.slot, [{ op: "ADD", element: rule, evidence: [q1Policy] }], corpus, { date: DATE }).published, true);
+  const r = await runExperiment(fx.slot, fx.work, CFG, { task: "t", base: answer, variant: fixed, tests: ["C.route"], predict: "better" }, { ask: askRows, date: DATE });
+  assert.equal(r.outcome, "confirmed");
+  await assert.rejects(
+    runExperiment(fx.slot, fx.work, CFG, { task: "t", base: answer, variant: { ...fixed, rows: [fixed.rows[0], { id: "c", route: "y" }] }, tests: ["C.route"], predict: "better" }, { ask: askRows, date: DATE }),
+    /also changes rows\[1\]\.id/,
+  );
 });
 
 test("an experiment that moves as predicted makes a hypothesis active", async () => {

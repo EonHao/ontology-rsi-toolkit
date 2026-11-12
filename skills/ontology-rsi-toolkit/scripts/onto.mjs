@@ -835,16 +835,33 @@ export function judgeCalls(work) {
   return out;
 }
 
-/** Answer fields as dotted paths. Objects are walked; a list is one field. */
+const isRecordList = (v) => Array.isArray(v) && v.length > 0 && v.every((x) => isObj(x) && Object.keys(x).length > 0);
+
+/**
+ * Answer fields as paths: `a.b` into objects, `rows[2].status` into a list of records. A list
+ * of plain values is one field.
+ */
 export function leafPaths(value, prefix = "") {
   const out = new Map();
   if (!isObj(value)) return out;
   for (const [k, v] of Object.entries(value)) {
     const p = prefix ? `${prefix}.${k}` : k;
     if (isObj(v) && Object.keys(v).length > 0) for (const [q, c] of leafPaths(v, p)) out.set(q, c);
+    else if (isRecordList(v)) v.forEach((item, i) => leafPaths(item, `${p}[${i}]`).forEach((c, q) => out.set(q, c)));
     else out.set(p, canonical(v));
   }
   return out;
+}
+
+/** `rows[2].status` → ["rows", 2, "status"]. */
+function pathKeys(p) {
+  const keys = [];
+  for (const part of p.split(".")) {
+    const m = /^(.*?)((?:\[\d+\])*)$/.exec(part);
+    keys.push(m[1]);
+    for (const i of m[2].matchAll(/\[(\d+)\]/g)) keys.push(Number(i[1]));
+  }
+  return keys;
 }
 
 export function changedPaths(a, b) {
@@ -853,9 +870,24 @@ export function changedPaths(a, b) {
   return [...new Set([...A.keys(), ...B.keys()])].filter((p) => A.get(p) !== B.get(p)).sort();
 }
 
+function getPath(answer, p) {
+  let cur = answer;
+  for (const k of pathKeys(p)) cur = cur?.[k];
+  return cur;
+}
+
+function withValue(answer, p, value) {
+  const out = clone(answer);
+  const keys = pathKeys(p);
+  let cur = out;
+  for (const k of keys.slice(0, -1)) cur = cur[k];
+  cur[keys.at(-1)] = value;
+  return out;
+}
+
 function withoutPath(answer, p) {
   const out = clone(answer);
-  const keys = p.split(".");
+  const keys = pathKeys(p);
   let cur = out;
   for (const k of keys.slice(0, -1)) cur = cur[k];
   delete cur[keys.at(-1)];
@@ -865,6 +897,10 @@ function withoutPath(answer, p) {
 /**
  * Knock-out map of one answer: remove one field at a time and judge again. A drop means the
  * field earned credit. No change means it earned none: it is wrong, or it is not scored alone.
+ * Fields of records in a list are removed one record at a time, so a list that is partly right
+ * shows which records and which of their fields are wrong.
+ * A true/false field without credit is then flipped: if the score rises it was wrong, and if
+ * nothing moves it is not scored. Other fields without credit stay undecided between the two.
  */
 export async function localize(work, cfg, task, answer, ask) {
   const base = await judgeAnswer(work, cfg, task, answer, ask);
@@ -877,7 +913,25 @@ export async function localize(work, cfg, task, answer, ask) {
     else if (s > base.score) penalized.push({ path: p, delta: round4(s - base.score) });
     else noCredit.push(p);
   }
-  const rec = { task, answer_sha: base.answer_sha, score: base.score, credited, no_credit: noCredit, penalized };
+  const wrong = [];
+  const unscored = [];
+  for (const p of noCredit) {
+    const v = getPath(answer, p);
+    if (typeof v !== "boolean") continue;
+    const s = (await judgeAnswer(work, cfg, task, withValue(answer, p, !v), ask)).score;
+    if (s > base.score) wrong.push({ path: p, delta: round4(s - base.score) });
+    else if (s === base.score) unscored.push(p);
+  }
+  const rec = {
+    task,
+    answer_sha: base.answer_sha,
+    score: base.score,
+    credited,
+    no_credit: noCredit,
+    penalized,
+    wrong,
+    unscored,
+  };
   const dir = path.join(work, "localize");
   fs.mkdirSync(dir, { recursive: true });
   fs.writeFileSync(
@@ -901,24 +955,43 @@ export function gaps(work) {
       if (!best.has(rec.task) || rec.score > best.get(rec.task).score) best.set(rec.task, rec);
     }
   }
+  // Records of a list are counted under one path: rows[2].status and rows[5].status are rows.status.
+  const flat = (p) => p.replace(/\[\d+\]/g, "");
   const byPath = new Map();
+  const at = (p) => {
+    if (!byPath.has(p)) byPath.set(p, { path: p, tasks: new Set(), no_credit: 0, wrong: 0, credited: 0 });
+    return byPath.get(p);
+  };
   for (const rec of best.values()) {
+    const unscored = new Set(rec.unscored || []);
+    const wrong = new Set((rec.wrong || []).map((x) => x.path));
+    for (const c of rec.credited) at(flat(c.path)).credited += 1;
     for (const p of [...rec.no_credit, ...rec.penalized.map((x) => x.path)]) {
-      if (!byPath.has(p)) byPath.set(p, []);
-      byPath.get(p).push(rec.task);
+      if (unscored.has(p)) continue;
+      const g = at(flat(p));
+      g.tasks.add(rec.task);
+      g.no_credit += 1;
+      if (wrong.has(p)) g.wrong += 1;
     }
   }
   return {
     tasks: [...best.values()]
       .map((r) => ({ task: r.task, score: r.score }))
       .sort((a, b) => a.task.localeCompare(b.task)),
-    gaps: [...byPath.entries()]
-      .map(([p, tasks]) => ({ path: p, tasks: tasks.sort() }))
-      .sort((a, b) => b.tasks.length - a.tasks.length || a.path.localeCompare(b.path)),
+    // `wrong` counts fields a flip proved wrong; `credited` counts places where the same field
+    // earned credit, which shows that it is scored at all.
+    gaps: [...byPath.values()]
+      .filter((g) => g.no_credit > 0)
+      .map((g) => ({ ...g, tasks: [...g.tasks].sort() }))
+      .sort((a, b) => b.tasks.length - a.tasks.length || b.wrong - a.wrong || b.no_credit - a.no_credit || a.path.localeCompare(b.path)),
   };
 }
 
-const covers = (decides, p) => decides.some((d) => p === d || p.startsWith(`${d}.`) || d.startsWith(`${p}.`));
+/** Whether a decided path covers an answer field. `rows.status` covers `rows[2].status`: a rule speaks of every record. */
+function covers(decides, p) {
+  const flat = p.replace(/\[\d+\]/g, "");
+  return decides.some((d) => flat === d || flat.startsWith(`${d}.`) || d.startsWith(`${flat}.`));
+}
 const signed = (x) => `${x > 0 ? "+" : ""}${x}`;
 
 /**
