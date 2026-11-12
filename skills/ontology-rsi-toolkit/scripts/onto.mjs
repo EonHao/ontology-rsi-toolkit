@@ -807,14 +807,14 @@ async function httpAsk(cfg, task, answer) {
  * reply kept under work/judge/, so repeating a question costs nothing and the count of files is
  * the count of judge calls. A per-task budget, when set, refuses the call that would exceed it.
  */
-export async function judgeAnswer(work, cfg, task, answer, ask = httpAsk) {
+export async function judgeAnswer(work, cfg, task, answer, ask = httpAsk, opts = {}) {
   const digest = sha(canonical(answer));
   const dir = path.join(work, "judge");
   const file = path.join(dir, `${safeName(task)}-${digest.slice(0, 16)}.json`);
   if (fs.existsSync(file)) return { ...readJson(file), cached: true };
   fs.mkdirSync(dir, { recursive: true });
   const used = fs.readdirSync(dir).filter((f) => f.startsWith(`${safeName(task)}-`)).length;
-  if (cfg.budget_per_task !== null && used >= cfg.budget_per_task)
+  if (!opts.measurement && cfg.budget_per_task !== null && used >= cfg.budget_per_task)
     throw new Error(`judge budget for ${task} is spent (${used} of ${cfg.budget_per_task} calls)`);
   const reply = await ask(cfg, task, answer);
   const raw = cfg.score_path.split(".").reduce((v, k) => (v == null ? v : v[k]), reply);
@@ -1125,21 +1125,38 @@ function attemptAnswer(work, rec) {
  * An element is judged in the tasks where its value passed an experiment, so that both gates
  * stand on the same task. One with a gain is marked reproduced in that task. One that moved
  * nothing in any of its tasks goes back to hypothesis: the rule did not reach the Actor. One
- * that only held stays, with no gain shown. An element charged with a harm is retired.
+ * that only held stays, with no gain shown. An element charged with a harm is retired. One
+ * tested only in tasks without a pair of attempts was never replicated and goes back to
+ * hypothesis.
  */
 export async function replicate(slot, work, cfg, opts = {}) {
   const from = opts.from || "baseline";
   const to = opts.to || "verify";
   const { onto } = loadSlot(slot);
+  const deployedDecides = onto.elements
+    .filter((e) => e.status === "active" && isPolicy(e.kind))
+    .flatMap((e) => e.decides);
+  // Only the fields some deployed rule decides are knocked out: replication measures the rules,
+  // and a list of many records would otherwise cost hundreds of calls. These calls measure;
+  // they do not search, so the per-task budget does not apply to them.
   const maps = {};
   for (const [task, phases] of Object.entries(attemptsByTask(work))) {
     if (!phases[from] || !phases[to]) continue;
-    const credit = async (rec) => {
-      const loc = await localize(work, cfg, task, attemptAnswer(work, rec), opts.ask);
-      const yes = new Set(loc.credited.map((c) => c.path));
-      return { yes, all: new Set([...yes, ...loc.no_credit, ...loc.penalized.map((c) => c.path)]) };
+    const A = attemptAnswer(work, phases[from]);
+    const B = attemptAnswer(work, phases[to]);
+    const paths = [...new Set([...leafPaths(A).keys(), ...leafPaths(B).keys()])].filter((p) => covers(deployedDecides, p));
+    const credit = async (answer) => {
+      const base = (await judgeAnswer(work, cfg, task, answer, opts.ask, { measurement: true })).score;
+      const yes = new Set();
+      const own = new Set(leafPaths(answer).keys());
+      for (const p of paths) {
+        if (!own.has(p)) continue;
+        const s = (await judgeAnswer(work, cfg, task, withoutPath(answer, p), opts.ask, { measurement: true })).score;
+        if (s < base) yes.add(p);
+      }
+      return { yes, all: new Set(paths) };
     };
-    maps[task] = { a: await credit(phases[from]), b: await credit(phases[to]) };
+    maps[task] = { a: await credit(A), b: await credit(B) };
   }
   if (Object.keys(maps).length === 0) throw new Error(`no task has both a ${from} and a ${to} attempt`);
 
@@ -1207,11 +1224,17 @@ export async function replicate(slot, work, cfg, opts = {}) {
       el.status = "candidate";
       lines.push(`DEMOTE ${el.id}: no Actor gained credit on what it decides; back to hypothesis`);
       row.result = "not reproduced";
+    } else if (outcomes.length) {
+      row.result = "held";
     } else {
-      row.result = outcomes.length ? "held" : "not applicable";
+      // No task where it was tested has a pair of attempts: it was never replicated, and a rule
+      // that has not passed both gates does not reach the Target.
+      el.status = "candidate";
+      lines.push(`UNREPLICATED ${el.id}: no ${to} attempt in a task where it was tested; back to hypothesis`);
+      row.result = "not replicated";
     }
     el.support = supportOf(el);
-    if (row.result !== "held" && row.result !== "not applicable") el.updated = next.version;
+    if (row.result !== "held") el.updated = next.version;
     report.push(row);
   }
   appendJsonl(path.join(work, "replications.jsonl"), { from, to, version: onto.version, elements: report });
@@ -1346,10 +1369,23 @@ export function initSlot(slot, opts = {}) {
   }
 }
 
-/** The deployable copy: reader, view, and the active elements of ontology.json without provenance. */
+const EXPORTED = new Set(["SKILL.md", "ONTOLOGY.md", "ontology.json"]);
+
+/**
+ * The deployable copy. The destination holds exactly what the slot produces: any other file in it
+ * is removed, so nothing written beside the export can reach the Target. A destination with a
+ * subfolder is refused rather than emptied.
+ */
 export function exportSlot(slot, dest) {
   const { onto } = loadSlot(slot);
   fs.mkdirSync(dest, { recursive: true });
+  const removed = [];
+  for (const entry of fs.readdirSync(dest, { withFileTypes: true })) {
+    if (EXPORTED.has(entry.name) || entry.name === ".keep") continue;
+    if (!entry.isFile()) throw new Error(`${dest} holds ${entry.name}, which is not a file the export writes; refusing to export there`);
+    fs.rmSync(path.join(dest, entry.name));
+    removed.push(entry.name);
+  }
   const lean = {
     format: onto.format,
     version: onto.version,
@@ -1364,7 +1400,7 @@ export function exportSlot(slot, dest) {
   fs.copyFileSync(path.join(slot, "SKILL.md"), path.join(dest, "SKILL.md"));
   fs.copyFileSync(path.join(slot, "ONTOLOGY.md"), path.join(dest, "ONTOLOGY.md"));
   fs.writeFileSync(path.join(dest, "ontology.json"), `${JSON.stringify(lean, null, 2)}\n`);
-  return { version: onto.version, elements: lean.elements.length };
+  return { version: onto.version, elements: lean.elements.length, ...(removed.length ? { removed } : {}) };
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1625,6 +1661,7 @@ function parseArgs(argv) {
   return { pos, flags };
 }
 
+const PHASES = new Set(["baseline", "verify"]);
 const list = (v) => (v === undefined || v === true ? [] : Array.isArray(v) ? v : [v]);
 const print = (v) => process.stdout.write(`${JSON.stringify(v, null, 2)}\n`);
 
@@ -1636,6 +1673,12 @@ export async function main(argv, hooks = {}) {
     if (str(k) === undefined) throw new Error(`${cmd} needs --${k}`);
     return str(k);
   };
+  // One run, one work directory: when the configuration names one, every command must use it.
+  if (str("config") && str("work")) {
+    const named = readJson(str("config"))?.paths?.work;
+    if (named && path.resolve(named) !== path.resolve(str("work")))
+      throw new Error(`--work ${str("work")} is not the run's work directory ${named} (training-request.json, paths.work)`);
+  }
   const record = (rec) => {
     if (str("work")) appendJsonl(path.join(str("work"), "records.jsonl"), { time: new Date().toISOString(), ...rec });
   };
@@ -1713,6 +1756,8 @@ export async function main(argv, hooks = {}) {
     case "judge": {
       const work = need("work");
       const task = need("task");
+      if (str("phase") !== undefined && !PHASES.has(str("phase")))
+        throw new Error(`--phase must be baseline or verify; every attempt an Actor makes is recorded under one of them`);
       const r = await judgeAnswer(work, loadJudgeConfig(need("config")), task, readJson(need("answer")), hooks.ask);
       if (str("phase"))
         record({

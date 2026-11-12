@@ -1,7 +1,7 @@
 ---
 name: ontology-training
 description: Run the Ontology RSI loop as the Ontologist inside one continuing training environment - baseline attempts, a map of where credit is lost, rules tested by experiment on the judge and then reproduced by fresh Actors, and export of the final slot.
-version: 2026.11.12.3
+version: 2026.11.12.4
 ---
 
 # Ontology training
@@ -21,7 +21,7 @@ SLOT    = WORK/slot          the working ontology, with provenance
 CORPUS  = WORK/corpus        what extract pulled from Traces
 ```
 
-Pass `--config CONFIG --work WORK` to every `judge`, `localize`, `experiment` and `replicate` call, `--work WORK` to `apply`, and `--snapshots WORK/snapshots` to `apply`, `experiment` and `replicate`. The script appends each step to `WORK/records.jsonl`; do not write that file yourself. Keep `WORK/state.json` current (phase, next task) so that a compacted session resumes instead of restarting.
+Pass `--config CONFIG --work WORK` to every `judge`, `localize`, `experiment`, `replicate` and `apply` call, and `--snapshots WORK/snapshots` to `apply`, `experiment` and `replicate`. Always the absolute `WORK` from the request: the script refuses any other work directory, so that one run keeps one set of records.
 
 ## Set up
 
@@ -98,7 +98,7 @@ Before phase 4, run the export once (see *Export*). If the session ends early, w
 
 ## Phase 4: reproduce
 
-An experiment shows that a value is right. It does not show that the rule you wrote produces it. Run one attempt per task with phase `verify` on the published ontology: these Actors have the rules and nothing else. Then:
+An experiment shows that a value is right. It does not show that the rule you wrote produces it. Run one attempt per task with phase `verify` on the published ontology: these Actors have the rules and nothing else. Then: Every task gets a `verify` attempt: a rule tested only in tasks without one has never been replicated, and `replicate` takes it out of the view.
 
 ```bash
 SCRIPT replicate SLOT --config CONFIG --work WORK --snapshots WORK/snapshots
@@ -111,7 +111,9 @@ It compares each task's `baseline` and `verify` answers field by field, and judg
 - `not reproduced`: the fields had no credit before or after. The rule goes back to hypothesis and leaves the view. The value is right, so the wording failed: rewrite the rule so that a stranger could follow it (which records, selected how, in which order), confirm it again by experiment, and repeat the attempt for that task if time allows.
 - `harm`: a field that had credit lost it. The rule is retired.
 
-Run `replicate` again after any repeated attempt; the last `verify` attempt of a task counts.
+Run `replicate` again after any repeated attempt; the last `verify` attempt of a task counts. `replicate` knocks out only the fields that deployed rules decide, and its calls are measurements, not search, so the judge budget does not apply to them: never skip a task's replication because of the budget.
+
+Every attempt an Actor makes on the published ontology is a `verify` attempt, whatever its score. The script accepts no other phase label. An attempt that scores below the baseline is the evidence this phase exists to find; recording it under another name, or leaving it out, would deploy the rule that caused it.
 
 Never rerun an attempt because its score is low, and never hand an Actor a variant.
 
@@ -133,6 +135,7 @@ One command validates the slot, writes the deployable copy, copies each task's l
 
 - The Actor sees only the public task, the access brief and its frozen slot.
 - Only the script changes `SLOT` and only the script asks the judge. Never call the judge endpoint yourself, and never edit `ontology.json`, `ONTOLOGY.md`, `SKILL.md`, the corpus or the records by hand.
+- The export folder (`paths.skill_export`) is written by `finish` alone. `finish` removes any other file from it, and the Organizer deploys a fresh export of the validated slot, not the folder. Write notes, recipes and playbooks into `WORK` if you want them kept for the report; they never reach the Target.
 - A variant is evidence about a rule, built from the rule. Searching answer values until the score rises, with no rule that produces them, teaches nothing that transfers: do not do it.
 - Read nothing under `rubric/`, `solution/` or `tests/`, and no verifier output.
 - The script blocks instance ids it can recognize. You keep out everything else that makes sense for one case only: dates, amounts, names, answer values.

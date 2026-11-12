@@ -602,6 +602,36 @@ test("replication: a rule whose fields already had credit is kept, with no gain 
   assert.match(view(fx), /tested in 1 task, not yet reproduced/);
 });
 
+test("replication: a rule never paired with a verify attempt leaves the view; measurement ignores the budget", async () => {
+  const { fx } = seeded();
+  await exp(fx, { task: "train_001", base: BASE.train_001, variant: { ...BASE.train_001, decision: "deny" }, tests: ["A.release_payment"], predict: "better" });
+  await exp(fx, { task: "train_002", base: BASE.train_002, variant: { ...BASE.train_002, audit: GOLD.train_002.audit }, tests: ["P.policy_first"], predict: "better" });
+  // Only train_001 gets a verify attempt: P.policy_first, tested in train_002 alone, was never replicated.
+  for (const t of ["train_001", "train_002"]) await attempt(fx, "baseline", t, BASE[t]);
+  await attempt(fx, "verify", "train_001", { ...BASE.train_001, decision: "deny" });
+  const before = asked;
+  const r = await replicate(fx.slot, fx.work, { ...CFG, budget_per_task: 1 }, { ask, date: DATE });
+  const result = Object.fromEntries(r.elements.map((e) => [e.id, e.result]));
+  assert.deepEqual(result, { "A.release_payment": "reproduced", "P.policy_first": "not replicated" });
+  assert.equal(el(fx, "P.policy_first").status, "candidate");
+  assert.ok(!view(fx).includes("P.policy_first"));
+  // Only decided fields are knocked out: decision and the two audit fields, in two answers.
+  assert.ok(asked - before <= 6, `replication asked the judge ${asked - before} times`);
+});
+
+test("export owns its folder: files written beside it are removed", () => {
+  const { fx } = seeded();
+  const dest = path.join(fx.root, "skill");
+  fs.mkdirSync(dest, { recursive: true });
+  fs.writeFileSync(path.join(dest, "PLAYBOOK.md"), "unchecked recipes");
+  fs.writeFileSync(path.join(dest, ".keep"), "");
+  const r = exportSlot(fx.slot, dest);
+  assert.deepEqual(r.removed, ["PLAYBOOK.md"]);
+  assert.deepEqual(fs.readdirSync(dest).sort(), [".keep", "ONTOLOGY.md", "SKILL.md", "ontology.json"]);
+  fs.mkdirSync(path.join(dest, "extra"));
+  assert.throws(() => exportSlot(fx.slot, dest), /refusing to export there/);
+});
+
 test("diff and skill versions", async () => {
   const { fx } = seeded();
   const before = JSON.parse(fs.readFileSync(path.join(fx.slot, "ontology.json"), "utf8"));
@@ -674,6 +704,16 @@ test("CLI end to end against an HTTP judge", async () => {
     fs.appendFileSync(path.join(fx.slot, "ONTOLOGY.md"), "tampered\n");
     assert.equal((await cli("validate", fx.slot, "--corpus", fx.corpusDir, "--work", fx.work)).code, 1);
     assert.equal((await cli("bogus")).code, 2);
+    // An attempt is baseline or verify, nothing else.
+    const bad = await cli("judge", "--task", "train_001", "--answer", variant, "--phase", "rejected", ...common);
+    assert.equal(bad.code, 2);
+    assert.match(bad.err, /--phase must be baseline or verify/);
+    // One run, one work directory.
+    const pinned = path.join(fx.root, "pinned.json");
+    fs.writeFileSync(pinned, JSON.stringify({ judge: { url: "http://127.0.0.1:1/" }, paths: { work: fx.work } }));
+    const stray = await cli("judge", "--task", "train_001", "--answer", variant, "--config", pinned, "--work", path.join(fx.work, "work"));
+    assert.equal(stray.code, 2);
+    assert.match(stray.err, /is not the run's work directory/);
   } finally {
     server.close();
   }

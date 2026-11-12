@@ -1,7 +1,7 @@
 ---
 name: ontology-rsi-toolkit
 description: Organize Ontology RSI experiments on published Benchmarks - learn a typed domain model (entities, relations, lifecycles, source precedence, action contracts, constraints) whose rules are each confirmed by a controlled experiment on the training judge, freeze it, and compare it with the baseline on independent tests.
-version: 2026.11.12.3
+version: 2026.11.12.4
 ---
 
 # Ontology RSI
@@ -36,7 +36,7 @@ Resolve provider, model and thinking level for Organizer, Ontologist, Actor and 
 1. **Prepare.** Follow [initialization.md](references/initialization.md) for the common base, the Actor template with its empty slot, the Ontologist State, the training request with its judge settings, and the public benchmark brief. Record versions, task order, roles, budgets, resource limits and the selection rule in `experiment.yaml`. Use the requested output directory, otherwise this Session's workspace or scratchpad.
 2. **Launch training.** Use the published adapter and CLI with the Ontologist State archive, explicit identity/runtime and benchmark limits. Launch one continuous training trial per independent unit; attempts and experiments run inside it, not as Harbor repetitions.
 3. **Monitor.** Save each launch configuration, State digest, job/trial path and process handle in `state.yaml`. Use the runtime's background mechanism with completion notifications. On resume, reconcile live processes and native results before launching missing work.
-4. **Collect.** From the trial's `artifacts/submission/`, take `skill/` (the exported slot) and `ontology-records/`. Re-run `node scripts/onto.mjs validate <records>/slot --corpus <records>/corpus --work <records>`; it must pass. Check that `skill/ONTOLOGY.md` equals the full slot's view. Incomplete or failing records mean the experiment is incomplete, not permission to export a convenient subset.
+4. **Collect.** From the trial's `artifacts/submission/`, take `ontology-records/`. Run `node scripts/onto.mjs validate <records>/slot --corpus <records>/corpus --work <records>`; it must pass. Then export the validated slot afresh (`onto.mjs export <records>/slot <dir>`) and deploy that, never the trial's `skill/` folder: compare the two and report any difference, such as a file the Ontologist wrote beside the export. A run with no `replicate` record passed the experiment gate only; report it as such. Incomplete or failing records mean the experiment is incomplete, not permission to export a convenient subset.
 5. **Test.** Freeze the exported slot before any test starts. Build the baseline and final States from the same base (initialization.md, *Test States*), then schedule a complete case × repetition matrix for each, each cell in a fresh environment and conversation. Test feedback never changes the ontology.
 6. **Report.** Follow [evaluation.md](references/evaluation.md) and its [common report fields](references/evaluation.md#common-report-fields), with `method: ontology`. Add the measures below.
 
