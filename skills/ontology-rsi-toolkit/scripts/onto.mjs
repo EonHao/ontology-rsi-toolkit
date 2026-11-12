@@ -1,24 +1,31 @@
 #!/usr/bin/env node
 // onto.mjs: the deterministic half of the Ontology RSI Toolkit. Plain Node, built-ins only.
 //
-// The Ontologist (a model) proposes typed edits; this script decides whether they are published.
-// It owns every rule that must not depend on a model's judgement: the schema, referential
-// integrity, verbatim evidence, the instance-id barrier, the lifecycle (candidate → active) and
-// the token budget. Run `node onto.mjs --help` for the commands.
+// The Ontologist (a model) proposes; this script decides. It owns every rule that must not
+// depend on a model's judgement:
+//   - structure (entities, relations, lifecycles) is published only with a verbatim quote of
+//     what the environment said;
+//   - policy (precedence, actions, constraints) is a hypothesis about what an answer field
+//     should be. It reaches the Actor only after an experiment confirms it: the script changes
+//     that field in a saved answer, asks the training judge, and compares the two scores. The
+//     prediction is an argument of the command, so it is fixed before the judge is called;
+//   - nothing that names an instance of a single task is published, and the rendered view
+//     stays within a token budget.
+// Run `node onto.mjs --help` for the commands.
 //
 // A learning slot is a Skill folder in the Target's State:
 //   SKILL.md       fixed reader body, versioned frontmatter
 //   ontology.json  the single source of truth (elements with provenance)
-//   ONTOLOGY.md    the view the Target reads, rendered from ontology.json
+//   ONTOLOGY.md    the view the Target reads: active elements only
 //   CHANGELOG.md   one entry per publication, no quotes
-//
-// A corpus directory holds what `extract` pulled from Traces and judge replies, one JSON file per
-// source. Evidence quotes are checked against it, and its instance ids feed the barrier.
+// A work directory holds the run's records: corpus/ (what `extract` pulled from Traces),
+// judge/ (one file per distinct answer judged), localize/, experiments.jsonl, records.jsonl.
+import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
-export const FORMAT = "ontology-rsi-toolkit/1";
+export const FORMAT = "ontology-rsi-toolkit/2";
 export const SLOT_SKILL = "domain-ontology";
 export const DEFAULT_BUDGET = 6000;
 export const CHARS_PER_TOKEN = 4;
@@ -34,20 +41,18 @@ export const KINDS = {
   action: "A",
   constraint: "C",
 };
-const KIND_ORDER = Object.keys(KINDS);
 const PREFIX_KIND = Object.fromEntries(Object.entries(KINDS).map(([k, p]) => [p, k]));
-/** Kinds whose content is read off data. Everything else is policy, and policy starts as a candidate. */
+/** Kinds read off data. The other three are policy: hypotheses that an experiment must confirm. */
 const STRUCTURAL = new Set(["entity", "relation", "lifecycle"]);
+const isPolicy = (kind) => !STRUCTURAL.has(kind);
 const ID_RE = /^[ERLPAC]\.[A-Za-z][A-Za-z0-9_]{1,63}$/;
 const REF_RE = /(?<![A-Za-z0-9_.])[ERLPAC]\.[A-Za-z][A-Za-z0-9_]{1,63}(?![A-Za-z0-9_])/g;
 const STATUSES = new Set(["candidate", "active", "retired"]);
-const ORIGINS = new Set(["observed", "inferred"]);
 const META = new Set([
   "id",
   "kind",
   "scope",
   "status",
-  "origin",
   "support",
   "evidence",
   "counterexamples",
@@ -59,18 +64,12 @@ const META = new Set([
 
 /**
  * Content fields per kind. Types: str, strs (list of strings), map (string → string),
- * enums (string → list of strings), ref (an E. id), refs (list of E. ids), refmap (string → E. id),
+ * enums (string → list of strings), ref (an E. id), refs, refmap (string → E. id),
  * transitions ([{from, to, when?}]), int, card (cardinality).
+ * `decides` lists the answer fields a policy element determines, as dotted paths.
  */
 export const FIELDS = {
-  entity: {
-    name: "str",
-    description: "str",
-    source: "strs",
-    key: "str",
-    fields: "map",
-    enums: "enums",
-  },
+  entity: { name: "str", description: "str", source: "strs", key: "str", fields: "map", enums: "enums" },
   relation: { from: "ref", to: "ref", via: "str", cardinality: "card", description: "str" },
   lifecycle: {
     entity: "ref",
@@ -80,8 +79,9 @@ export const FIELDS = {
     terminal: "strs",
     description: "str",
   },
-  precedence: { entity: "ref", prefer: "str", over: "str", when: "str", description: "str" },
+  precedence: { decides: "strs", entity: "ref", prefer: "str", over: "str", when: "str", description: "str" },
   action: {
+    decides: "strs",
     name: "str",
     description: "str",
     params: "refmap",
@@ -91,33 +91,33 @@ export const FIELDS = {
     order: "int",
     failure_signatures: "strs",
   },
-  constraint: { rule: "str", entities: "refs", check: "str", description: "str" },
+  constraint: { decides: "strs", rule: "str", entities: "refs", check: "str", description: "str" },
 };
 const REQUIRED = {
   entity: ["name", "source"],
   relation: ["from", "to", "via"],
   lifecycle: ["entity", "field", "states"],
-  precedence: ["prefer", "over"],
-  action: ["name", "preconditions"],
-  constraint: ["rule"],
+  precedence: ["decides", "prefer", "over"],
+  action: ["decides", "name", "preconditions"],
+  constraint: ["decides", "rule"],
 };
 const CARDINALITIES = new Set(["1:1", "1:n", "n:1", "n:m"]);
 
 export const READER_BODY = `# Domain ontology
 
-ONTOLOGY.md beside this file is a typed model of the domain you work in, learned from earlier runs: record types and where they live, how they relate, the states they move through, which source wins when two disagree, the contract of each business action, and the constraints that hold across records. It describes the domain, not any one task.
+ONTOLOGY.md beside this file is a typed model of the domain you work in, learned from earlier runs. Its structure entries say which record types exist, where they live and how they link. Its policy entries say what an answer field must be and why; each was confirmed by experiment on earlier tasks and names the answer fields it decides. It describes the domain, not any one task.
 
 1. Read ONTOLOGY.md before your first substantive action.
-2. Find records through the sources its entities name. When two sources disagree, apply its precedence entries.
-3. Before you submit, check every business decision in your answer against the preconditions and required evidence of the matching action, and fetch any evidence you have not seen yet.
-4. Entries marked candidate are unconfirmed: check them against data before you rely on them. When an entry conflicts with the task's own instructions or with data you fetched, the task and the data win.
+2. Find records through the sources its entities name.
+3. Before you submit, go through the policy entries whose scope fits this task. For every answer field an entry decides, make your answer follow the entry, and fetch any record it needs that you have not seen yet.
+4. When an entry conflicts with the task's own instructions or with data you fetched, the task and the data win.
 5. Before you finish, write the ids of the entries you actually relied on, one per line, to ontology-used.txt in this Session's scratchpad. Leave out entries you only read.
 
 Keep this folder unchanged during a task. Do not read ontology.json, experiment records or any scoring material.
 `;
 
 const SKILL_DESCRIPTION =
-  "Typed model of this agent's working domain (record types, relations, lifecycles, source precedence, action contracts, constraints), learned from its own runs. Read it before the first substantive action of any task in this domain.";
+  "Typed model of this agent's working domain (record types, relations, lifecycles, source precedence, action contracts, constraints), learned from its own runs and confirmed by experiment. Read it before the first substantive action of any task in this domain.";
 
 /** Conditional, so the same line can sit in a baseline State that has no slot. */
 export const AGENTS_LINE =
@@ -130,10 +130,8 @@ const norm = (s) => String(s).replace(/\s+/g, " ").trim();
 const isObj = (v) => v !== null && typeof v === "object" && !Array.isArray(v);
 const clone = (v) => structuredClone(v);
 const today = () => new Date().toISOString().slice(0, 10);
-
-function readJson(file) {
-  return JSON.parse(fs.readFileSync(file, "utf8"));
-}
+const readJson = (file) => JSON.parse(fs.readFileSync(file, "utf8"));
+const round4 = (x) => Math.round(x * 1e4) / 1e4;
 
 function writeAtomic(file, text) {
   const tmp = `${file}.tmp-${process.pid}`;
@@ -152,6 +150,38 @@ function containsToken(haystack, token) {
 
 export function estimateTokens(text) {
   return Math.ceil(text.length / CHARS_PER_TOKEN);
+}
+
+/** JSON with sorted keys: equal values give equal text, so answers can be hashed and compared. */
+export function canonical(value) {
+  if (Array.isArray(value)) return `[${value.map(canonical).join(",")}]`;
+  if (isObj(value)) {
+    return `{${Object.keys(value)
+      .sort()
+      .map((k) => `${JSON.stringify(k)}:${canonical(value[k])}`)
+      .join(",")}}`;
+  }
+  return JSON.stringify(value) ?? "null";
+}
+
+const sha = (text) => crypto.createHash("sha256").update(text).digest("hex");
+
+function safeName(s) {
+  return s.replace(/[^A-Za-z0-9_.-]/g, "_");
+}
+
+function appendJsonl(file, rec) {
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  fs.appendFileSync(file, `${JSON.stringify(rec)}\n`);
+}
+
+function readJsonl(file) {
+  if (!fs.existsSync(file)) return [];
+  return fs
+    .readFileSync(file, "utf8")
+    .split("\n")
+    .filter((l) => l.trim())
+    .map((l) => JSON.parse(l));
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -190,11 +220,30 @@ export function loadSlot(slot) {
   return { onto, skill: parseSkillMd(skillText), skillText };
 }
 
+/** Writes a new version of the slot: ontology.json, the view, the reader's version, the changelog. */
+function publish(slot, onto, lines, opts = {}) {
+  const { skill } = loadSlot(slot);
+  const date = opts.date || today();
+  const skillVersion = nextSkillVersion(skill?.front?.version, date);
+  writeAtomic(path.join(slot, "ontology.json"), `${JSON.stringify(onto, null, 2)}\n`);
+  writeAtomic(path.join(slot, "ONTOLOGY.md"), render(onto));
+  writeAtomic(path.join(slot, "SKILL.md"), skillMd(skillVersion));
+  fs.appendFileSync(
+    path.join(slot, "CHANGELOG.md"),
+    `\n## v${onto.version} · ${date}\n\n${lines.map((l) => `- ${l}`).join("\n")}\n`,
+  );
+  if (opts.snapshots) {
+    fs.mkdirSync(opts.snapshots, { recursive: true });
+    fs.copyFileSync(path.join(slot, "ontology.json"), path.join(opts.snapshots, `v${onto.version}.json`));
+  }
+  return skillVersion;
+}
+
 // ---------------------------------------------------------------------------------------------
 // Corpus
 
 /**
- * Loads every corpus file in `dir`. Returns sessions (id → {task, kind, text}), the forbidden
+ * Loads every corpus file in `dir`. Returns sessions (id → {task, text, used}), the forbidden
  * instance ids with the reason for each, and the task labels seen.
  */
 export function loadCorpus(dir) {
@@ -207,12 +256,7 @@ export function loadCorpus(dir) {
     if (!name.endsWith(".json")) continue;
     const rec = readJson(path.join(dir, name));
     const text = norm((rec.sources || []).map((s) => s.text).join("\n"));
-    sessions.set(rec.session, {
-      task: rec.task,
-      kind: rec.kind,
-      text,
-      used: new Set(rec.used || []),
-    });
+    sessions.set(rec.session, { task: rec.task, text, used: new Set(rec.used || []) });
     if (rec.task && rec.task !== PROBE_TASK) tasks.add(rec.task);
     for (const id of rec.instance_ids || []) {
       if (!idTasks.has(id)) idTasks.set(id, new Set());
@@ -248,25 +292,24 @@ function checkQuote(corpus, ev) {
 // Element checks
 
 function typeError(kind, field, type, v) {
+  const strs = (x) => Array.isArray(x) && x.every((y) => typeof y === "string" && norm(y).length > 0);
+  const ref = (x) => typeof x === "string" && /^E\./.test(x) && ID_RE.test(x);
   const ok = (() => {
     switch (type) {
       case "str":
         return typeof v === "string" && norm(v).length > 0;
       case "strs":
-        return Array.isArray(v) && v.every((x) => typeof x === "string" && norm(x).length > 0);
+        return strs(v);
       case "map":
         return isObj(v) && Object.values(v).every((x) => typeof x === "string");
       case "enums":
-        return (
-          isObj(v) &&
-          Object.values(v).every((x) => Array.isArray(x) && x.every((y) => typeof y === "string"))
-        );
+        return isObj(v) && Object.values(v).every(strs);
       case "ref":
-        return typeof v === "string" && /^E\./.test(v) && ID_RE.test(v);
+        return ref(v);
       case "refs":
-        return Array.isArray(v) && v.every((x) => typeof x === "string" && /^E\./.test(x) && ID_RE.test(x));
+        return Array.isArray(v) && v.every(ref);
       case "refmap":
-        return isObj(v) && Object.values(v).every((x) => typeof x === "string" && /^E\./.test(x) && ID_RE.test(x));
+        return isObj(v) && Object.values(v).every(ref);
       case "transitions":
         return (
           Array.isArray(v) &&
@@ -304,6 +347,8 @@ export function checkContent(el) {
     if (e) errors.push(e);
   }
   for (const k of REQUIRED[el.kind]) if (el[k] === undefined) errors.push(`${el.kind} needs ${k}`);
+  if (isPolicy(el.kind) && Array.isArray(el.decides) && el.decides.length === 0)
+    errors.push(`${el.kind}.decides must name at least one answer field`);
   if (el.kind === "lifecycle" && Array.isArray(el.states)) {
     const states = new Set(el.states);
     for (const t of el.transitions || []) {
@@ -313,6 +358,21 @@ export function checkContent(el) {
     for (const t of el.terminal || []) if (!states.has(t)) errors.push(`terminal ${t} is not in states`);
   }
   return errors;
+}
+
+/** All human-readable strings of an element's content and scope. */
+function contentTexts(el) {
+  const out = [];
+  const walk = (v) => {
+    if (typeof v === "string") out.push(v);
+    else if (Array.isArray(v)) v.forEach(walk);
+    else if (isObj(v)) for (const [k, x] of Object.entries(v)) (out.push(k), walk(x));
+  };
+  for (const [k, v] of Object.entries(el)) {
+    if (META.has(k) && k !== "scope") continue;
+    walk(v);
+  }
+  return out;
 }
 
 /** Every id an element points at: structured references plus `X.name` tokens in its text. */
@@ -331,21 +391,6 @@ export function referencesOf(el) {
   return refs;
 }
 
-/** All human-readable strings of an element's content and scope. */
-function contentTexts(el) {
-  const out = [];
-  const walk = (v) => {
-    if (typeof v === "string") out.push(v);
-    else if (Array.isArray(v)) v.forEach(walk);
-    else if (isObj(v)) for (const [k, x] of Object.entries(v)) (out.push(k), walk(x));
-  };
-  for (const [k, v] of Object.entries(el)) {
-    if (META.has(k) && k !== "scope") continue;
-    walk(v);
-  }
-  return out;
-}
-
 function forbiddenIn(el, forbidden) {
   const text = contentTexts(el).join("\n");
   const hits = [];
@@ -355,9 +400,7 @@ function forbiddenIn(el, forbidden) {
   return hits;
 }
 
-function liveIds(onto) {
-  return new Set(onto.elements.filter((e) => e.status !== "retired").map((e) => e.id));
-}
+const liveIds = (onto) => new Set(onto.elements.filter((e) => e.status !== "retired").map((e) => e.id));
 
 function refErrors(el, onto) {
   const live = liveIds(onto);
@@ -374,48 +417,33 @@ function referrersOf(id, onto) {
     .map((e) => e.id);
 }
 
-// ---------------------------------------------------------------------------------------------
-// Support and lifecycle
-
-/** A quote, or a declared use that scored 100 or beat the previous attempt at the same task. */
-function isPositive(ev) {
-  if (ev.type === "use") return ev.score === 100 || ev.improved === true;
-  return true;
-}
-
+/**
+ * Structure: distinct tasks whose data was quoted. Policy: distinct tasks in which an experiment
+ * confirmed it. A quote shows that a situation exists; only an experiment shows that a rule holds.
+ */
 export function supportOf(el) {
+  const type = isPolicy(el.kind) ? "experiment" : "quote";
   const tasks = new Set();
   for (const ev of el.evidence || []) {
-    if (ev.task && ev.task !== PROBE_TASK && isPositive(ev)) tasks.add(ev.task);
+    if (ev.type === type && ev.task && ev.task !== PROBE_TASK) tasks.add(ev.task);
   }
   return tasks.size;
 }
 
-/** Candidate → active: at least two distinct tasks, or a retry of the same task that scored higher while using it. */
-function promoteIfDue(el) {
-  el.support = supportOf(el);
-  if (el.status !== "candidate") return false;
-  const improved = (el.evidence || []).some((ev) => ev.type === "use" && ev.improved === true);
-  if (el.support >= 2 || improved) {
-    el.status = "active";
-    return true;
-  }
-  return false;
-}
-
 // ---------------------------------------------------------------------------------------------
-// Render
-
-const statusTag = (el) =>
-  el.status === "candidate" ? `candidate · support ${el.support} · verify against data first` : `active · support ${el.support}`;
+// Render: what the Actor reads. Active elements only; a hypothesis never reaches the Actor.
 
 function line(label, value) {
   return value === undefined || value === "" ? null : `${label}: ${value}`;
 }
 
 function renderElement(el) {
-  const head = `### ${el.id} · ${statusTag(el)}${el.scope && el.scope !== "global" ? ` · scope: ${el.scope}` : ""}`;
+  const tags = [];
+  if (isPolicy(el.kind)) tags.push(`confirmed in ${el.support} task${el.support === 1 ? "" : "s"}`);
+  if (el.scope && el.scope !== "global") tags.push(`scope: ${el.scope}`);
+  const head = `### ${[el.id, ...tags].join(" · ")}`;
   const rows = [];
+  if (isPolicy(el.kind)) rows.push(line("Decides", el.decides.join(", ")));
   switch (el.kind) {
     case "entity":
       rows.push(line("Name", el.name));
@@ -489,19 +517,19 @@ const SECTION = {
   action: "Actions",
   constraint: "Constraints",
 };
+// Policy first: it is what changes an answer. Structure follows as the map to the records.
+const RENDER_ORDER = ["precedence", "action", "constraint", "entity", "relation", "lifecycle"];
 
 export function render(onto) {
-  const live = onto.elements.filter((e) => e.status !== "retired");
+  const active = onto.elements.filter((e) => e.status === "active");
   const out = [
     `# Domain ontology · v${onto.version}`,
     "",
-    "Generated from ontology.json; do not edit. Ids are stable: cite the ones you rely on in ontology-used.txt. `active` entries are confirmed by data or by repeated success; `candidate` entries are not, so check them against data before relying on them.",
+    "Generated from ontology.json; do not edit. Ids are stable: cite the ones you rely on in ontology-used.txt. Structure entries were read off the environment's own records. Policy entries name the answer fields they decide and were confirmed by experiment in the number of tasks shown.",
   ];
-  if (live.length === 0) {
-    out.push("", "Nothing has been learned yet.");
-  }
-  for (const kind of KIND_ORDER) {
-    const els = live
+  if (active.length === 0) out.push("", "Nothing has been learned yet.");
+  for (const kind of RENDER_ORDER) {
+    const els = active
       .filter((e) => e.kind === kind)
       .sort((a, b) =>
         kind === "action" && a.order !== b.order
@@ -516,11 +544,11 @@ export function render(onto) {
 }
 
 // ---------------------------------------------------------------------------------------------
-// Apply
+// Apply: ADD, REFINE, RETIRE, MERGE
 
-function contentOf(obj) {
-  return Object.fromEntries(Object.entries(obj).filter(([k]) => !META.has(k)));
-}
+const contentOf = (obj) => Object.fromEntries(Object.entries(obj).filter(([k]) => !META.has(k)));
+/** What a policy element claims: its content without the free-text description, plus its scope. */
+const ruleOf = (el) => canonical({ ...contentOf(el), description: null, scope: el.scope });
 
 function quoteEvidence(corpus, list, label) {
   if (!Array.isArray(list) || list.length === 0) return { error: `${label} needs at least one quote` };
@@ -551,12 +579,7 @@ export function applyOp(onto, op, corpus, version) {
       if (typeof el.id !== "string" || !ID_RE.test(el.id)) return fail(`bad id ${el.id}`);
       if (PREFIX_KIND[el.id[0]] !== el.kind) return fail(`id prefix ${el.id[0]} does not match kind ${el.kind}`);
       if (get(el.id)) return fail(`${el.id} exists${get(el.id).status === "retired" ? " (retired ids are never reused)" : ""}`);
-      const origin = el.origin ?? (STRUCTURAL.has(el.kind) ? "observed" : "inferred");
-      if (!ORIGINS.has(origin)) return fail(`origin must be observed or inferred`);
-      if (origin === "observed" && !STRUCTURAL.has(el.kind))
-        return fail(`${el.kind} is policy: its origin is inferred, and it starts as a candidate`);
-      const content = contentOf(el);
-      const draft = { id: el.id, kind: el.kind, scope: el.scope ?? "global", ...content };
+      const draft = { id: el.id, kind: el.kind, scope: norm(el.scope ?? "global"), ...contentOf(el) };
       const errs = checkContent(draft);
       if (errs.length) return fail(errs.join("; "));
       const q = quoteEvidence(corpus, op.evidence, "ADD");
@@ -567,61 +590,60 @@ export function applyOp(onto, op, corpus, version) {
       if (hits.length) return fail(`instance ids in content: ${hits.join(", ")}`);
       const added = {
         ...draft,
-        origin,
-        status: origin === "observed" ? "active" : "candidate",
+        status: isPolicy(el.kind) ? "candidate" : "active",
         support: 0,
         evidence: q.evidence,
         counterexamples: [],
         created: version,
         updated: version,
       };
-      promoteIfDue(added);
+      added.support = supportOf(added);
       onto.elements.push(added);
-      return { ok: true, summary: `ADD ${added.id} (${added.kind}, ${added.status})` };
+      return {
+        ok: true,
+        summary: `ADD ${added.id} (${added.kind}, ${added.status === "candidate" ? "hypothesis" : "active"})`,
+      };
     }
 
     case "REFINE": {
       const el = get(op.id);
       if (!live(op.id)) return fail(`${op.id} is not a live element`);
-      if (!isObj(op.set) && !Array.isArray(op.unset)) return fail("REFINE needs set and/or unset");
+      if (!isObj(op.set) && !Array.isArray(op.unset) && op.scope === undefined)
+        return fail("REFINE needs set, unset or scope");
       for (const k of Object.keys(op.set || {})) if (META.has(k)) return fail(`REFINE cannot set ${k}`);
       for (const k of op.unset || []) if (META.has(k) || REQUIRED[el.kind].includes(k)) return fail(`REFINE cannot unset ${k}`);
+      if (op.scope !== undefined && (typeof op.scope !== "string" || !norm(op.scope))) return fail("scope must be text");
       const draft = { ...clone(el), ...clone(op.set || {}) };
       for (const k of op.unset || []) delete draft[k];
+      if (op.scope !== undefined) draft.scope = norm(op.scope);
       const errs = checkContent(draft);
       if (errs.length) return fail(errs.join("; "));
-      const q = quoteEvidence(corpus, op.evidence, "REFINE");
-      if (q.error) return fail(q.error);
+      // Structure changes with what the data shows, so it needs a new quote. A changed policy is
+      // a new hypothesis: no quote can show that it holds, and its confirmations no longer apply.
+      let q = { evidence: [] };
+      if (!isPolicy(el.kind) || op.evidence !== undefined) {
+        q = quoteEvidence(corpus, op.evidence, "REFINE");
+        if (q.error) return fail(q.error);
+      }
       const refs = refErrors(draft, onto);
       if (refs.length) return fail(refs.join("; "));
       const hits = forbiddenIn(draft, corpus.forbidden);
       if (hits.length) return fail(`instance ids in content: ${hits.join(", ")}`);
+      const before = ruleOf(el);
       Object.assign(el, clone(op.set || {}));
       for (const k of op.unset || []) delete el[k];
+      if (op.scope !== undefined) el.scope = norm(op.scope);
       el.evidence.push(...q.evidence);
       el.updated = version;
-      const promoted = promoteIfDue(el);
-      return { ok: true, summary: `REFINE ${el.id}${promoted ? " (now active)" : ""}` };
-    }
-
-    case "SCOPE": {
-      const el = get(op.id);
-      if (!live(op.id)) return fail(`${op.id} is not a live element`);
-      if (typeof op.scope !== "string" || !norm(op.scope)) return fail("SCOPE needs a scope");
-      if (norm(op.scope) === norm(el.scope || "global")) return fail("SCOPE must change the scope");
-      const err = checkQuote(corpus, op.counterexample);
-      if (err) return fail(`counterexample: ${err}`);
-      const hits = forbiddenIn({ ...el, scope: op.scope }, corpus.forbidden);
-      if (hits.length) return fail(`instance ids in scope: ${hits.join(", ")}`);
-      el.scope = norm(op.scope);
-      el.counterexamples.push({
-        session: op.counterexample.session,
-        task: corpus.sessions.get(op.counterexample.session).task,
-        quote: norm(op.counterexample.quote),
-        note: op.note ? norm(op.note) : undefined,
-      });
-      el.updated = version;
-      return { ok: true, summary: `SCOPE ${el.id} → ${el.scope}` };
+      let note = "";
+      if (isPolicy(el.kind) && before !== ruleOf(el)) {
+        const had = el.evidence.some((ev) => ev.type === "experiment");
+        el.evidence = el.evidence.filter((ev) => ev.type !== "experiment");
+        el.status = "candidate";
+        if (had) note = " (rule changed: back to hypothesis, confirm it again)";
+      }
+      el.support = supportOf(el);
+      return { ok: true, summary: `REFINE ${el.id}${note}` };
     }
 
     case "RETIRE": {
@@ -630,15 +652,6 @@ export function applyOp(onto, op, corpus, version) {
       if (typeof op.reason !== "string" || !norm(op.reason)) return fail("RETIRE needs a reason");
       const by = referrersOf(op.id, onto);
       if (by.length) return fail(`${op.id} is referenced by ${by.join(", ")}; refine or retire those first`);
-      if (op.counterexample !== undefined) {
-        const err = checkQuote(corpus, op.counterexample);
-        if (err) return fail(`counterexample: ${err}`);
-        el.counterexamples.push({
-          session: op.counterexample.session,
-          task: corpus.sessions.get(op.counterexample.session).task,
-          quote: norm(op.counterexample.quote),
-        });
-      }
       el.status = "retired";
       el.retired_reason = norm(op.reason);
       el.updated = version;
@@ -648,6 +661,8 @@ export function applyOp(onto, op, corpus, version) {
     case "MERGE": {
       const keep = get(op.id);
       if (!live(op.id)) return fail(`${op.id} is not a live element`);
+      if (isPolicy(keep.kind))
+        return fail("MERGE is for structure; retire a policy element and add the merged rule as a new hypothesis");
       if (!Array.isArray(op.from) || op.from.length === 0) return fail("MERGE needs from");
       for (const id of op.from) {
         if (id === op.id) return fail("MERGE cannot merge an element into itself");
@@ -666,14 +681,13 @@ export function applyOp(onto, op, corpus, version) {
       const rewriteText = (s) => s.replace(REF_RE, (m) => (op.from.includes(m) ? op.id : m));
       for (const e of trial.elements) {
         if (e.status === "retired" || op.from.includes(e.id)) continue;
-        const spec = FIELDS[e.kind];
-        for (const [k, type] of Object.entries(spec)) {
+        for (const [k, type] of Object.entries(FIELDS[e.kind])) {
           if (e[k] === undefined) continue;
           if (type === "ref") e[k] = rename(e[k]);
           else if (type === "refs") e[k] = [...new Set(e[k].map(rename))];
           else if (type === "refmap") for (const p of Object.keys(e[k])) e[k][p] = rename(e[k][p]);
           else if (type === "str") e[k] = rewriteText(e[k]);
-          else if (type === "strs") e[k] = e[k].map(rewriteText);
+          else if (type === "strs" && k !== "decides") e[k] = e[k].map(rewriteText);
         }
       }
       const tKeep = trial.elements.find((e) => e.id === op.id);
@@ -682,14 +696,13 @@ export function applyOp(onto, op, corpus, version) {
         const src = trial.elements.find((e) => e.id === id);
         tKeep.evidence.push(...src.evidence);
         tKeep.counterexamples.push(...src.counterexamples);
-        if (src.status === "active") tKeep.status = "active";
         src.status = "retired";
         src.merged_into = op.id;
         src.retired_reason = `merged into ${op.id}`;
         src.updated = version;
       }
       tKeep.updated = version;
-      promoteIfDue(tKeep);
+      tKeep.support = supportOf(tKeep);
       for (const e of trial.elements) {
         if (e.status === "retired") continue;
         const r = refErrors(e, trial);
@@ -699,68 +712,20 @@ export function applyOp(onto, op, corpus, version) {
       return { ok: true, summary: `MERGE ${op.from.join(", ")} → ${op.id}` };
     }
 
-    case "SUPPORT": {
-      const el = get(op.id);
-      if (!live(op.id)) return fail(`${op.id} is not a live element`);
-      const s = corpus.sessions.get(op.session);
-      if (!s) return fail(`session ${op.session} is not in the corpus`);
-      let ev;
-      if (op.quote !== undefined) {
-        const err = checkQuote(corpus, { session: op.session, quote: op.quote });
-        if (err) return fail(err);
-        ev = { type: "quote", session: op.session, task: s.task, quote: norm(op.quote) };
-      } else if (isObj(op.use)) {
-        if (!s.used.has(op.id)) return fail(`${op.id} is not in the ontology-used.txt of session ${op.session}`);
-        const score = op.use.score;
-        if (typeof score !== "number" || score < 0 || score > 100) return fail("use.score must be 0–100");
-        const prev = op.use.prev_score;
-        if (prev !== undefined && (typeof prev !== "number" || prev < 0 || prev > 100))
-          return fail("use.prev_score must be 0–100");
-        ev = {
-          type: "use",
-          session: op.session,
-          task: s.task,
-          score,
-          ...(prev !== undefined ? { prev_score: prev } : {}),
-          improved: prev !== undefined && score > prev,
-        };
-        if (!isPositive(ev)) return fail(`a use that scored ${score}${prev !== undefined ? ` after ${prev}` : ""} is not support`);
-      } else {
-        return fail("SUPPORT needs a quote or a use");
-      }
-      const before = el.support;
-      el.evidence.push(ev);
-      el.updated = version;
-      const promoted = promoteIfDue(el);
-      return {
-        ok: true,
-        summary: `SUPPORT ${el.id} (${before} → ${el.support}${promoted ? ", now active" : ""})`,
-      };
-    }
-
     default:
-      return fail(`unknown op ${op.op}`);
+      return fail(`unknown op ${op.op}; the operations are ADD, REFINE, RETIRE and MERGE`);
   }
 }
 
-/** Retires the weakest unreferenced candidates until the rendered view fits the budget. */
-function fitBudget(onto) {
-  const retired = [];
-  for (;;) {
-    const tokens = estimateTokens(render(onto));
-    if (tokens <= onto.budget_tokens) return { tokens, retired };
-    const victim = onto.elements
-      .filter((e) => e.status === "candidate" && referrersOf(e.id, onto).length === 0)
-      .sort((a, b) => a.support - b.support || a.updated - b.updated || a.created - b.created)[0];
-    if (!victim) return { tokens, retired, over: true };
-    victim.status = "retired";
-    victim.retired_reason = "budget: weakest candidate";
-    retired.push(victim.id);
-  }
+function overBudget(onto) {
+  const tokens = estimateTokens(render(onto));
+  return tokens > onto.budget_tokens
+    ? `rendered view is ${tokens} tokens, over the budget of ${onto.budget_tokens}; consolidate with MERGE or RETIRE first`
+    : null;
 }
 
 export function applyEdits(slot, edits, corpus, opts = {}) {
-  const { onto, skill } = loadSlot(slot);
+  const { onto } = loadSlot(slot);
   const work = clone(onto);
   const version = onto.version + 1;
   const ops = Array.isArray(edits) ? edits : edits.operations;
@@ -772,43 +737,284 @@ export function applyEdits(slot, edits, corpus, opts = {}) {
     if (r.ok) applied.push({ index, summary: r.summary });
     else rejected.push({ index, op: op?.op, id: op?.id ?? op?.element?.id, reason: r.reason });
   });
-  const result = { published: false, version: onto.version, applied, rejected, auto_retired: [] };
+  const result = { published: false, version: onto.version, applied, rejected };
   if (applied.length === 0) return result;
   work.version = version;
-  const fit = fitBudget(work);
-  result.tokens = fit.tokens;
+  result.tokens = estimateTokens(render(work));
   result.budget = work.budget_tokens;
-  result.auto_retired = fit.retired;
-  if (fit.over) {
-    result.reason = `rendered view is ${fit.tokens} tokens, over the budget of ${work.budget_tokens}, with no candidate left to drop; consolidate with MERGE or RETIRE`;
-    return result;
-  }
+  const over = overBudget(work);
+  if (over) return { ...result, reason: over };
   if (opts.dryRun) return { ...result, dry_run: true };
-
-  const date = opts.date || today();
-  const skillVersion = nextSkillVersion(skill?.front?.version, date);
-  const changelog = [
-    `## v${version} · ${date}`,
-    "",
-    ...applied.map((a) => `- ${a.summary}`),
-    ...fit.retired.map((id) => `- RETIRE ${id}: budget, weakest candidate`),
-    "",
-  ].join("\n");
-  writeAtomic(path.join(slot, "ontology.json"), `${JSON.stringify(work, null, 2)}\n`);
-  writeAtomic(path.join(slot, "ONTOLOGY.md"), render(work));
-  writeAtomic(path.join(slot, "SKILL.md"), skillMd(skillVersion));
-  fs.appendFileSync(path.join(slot, "CHANGELOG.md"), `\n${changelog}`);
-  if (opts.snapshots) {
-    fs.mkdirSync(opts.snapshots, { recursive: true });
-    fs.copyFileSync(path.join(slot, "ontology.json"), path.join(opts.snapshots, `v${version}.json`));
-  }
+  const skillVersion = publish(
+    slot,
+    work,
+    applied.map((a) => a.summary),
+    opts,
+  );
   return { ...result, published: true, version, skill_version: skillVersion };
+}
+
+// ---------------------------------------------------------------------------------------------
+// The judge as an instrument: score an answer, find where credit is lost, test a hypothesis.
+
+/**
+ * Judge settings: `{url, body, score_path, scale, budget_per_task}`. In `body`, the string
+ * "{task}" becomes the task id and "{answer}" the answer itself. They may sit under a `judge`
+ * key of a larger file, such as training-request.json.
+ */
+export function loadJudgeConfig(file) {
+  const raw = readJson(file);
+  const cfg = raw.judge ?? raw;
+  if (typeof cfg.url !== "string") throw new Error(`${file}: judge.url is missing`);
+  return {
+    url: cfg.url,
+    body: cfg.body ?? { task_id: "{task}", answer: "{answer}" },
+    score_path: cfg.score_path ?? "score",
+    scale: cfg.scale ?? 100,
+    budget_per_task: cfg.budget_per_task ?? null,
+  };
+}
+
+function fillBody(template, task, answer) {
+  if (template === "{task}") return task;
+  if (template === "{answer}") return answer;
+  if (Array.isArray(template)) return template.map((t) => fillBody(t, task, answer));
+  if (isObj(template))
+    return Object.fromEntries(Object.entries(template).map(([k, v]) => [k, fillBody(v, task, answer)]));
+  return template;
+}
+
+/** Asks the judge over HTTP. Tests pass their own `ask` instead. */
+async function httpAsk(cfg, task, answer) {
+  const res = await fetch(cfg.url, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(fillBody(cfg.body, task, answer)),
+  });
+  const text = await res.text();
+  if (!res.ok) throw new Error(`judge answered ${res.status}: ${text.slice(0, 200)}`);
+  return JSON.parse(text);
+}
+
+/**
+ * Scores one answer, on the 0–100 scale. Each distinct answer of a task is judged once and its
+ * reply kept under work/judge/, so repeating a question costs nothing and the count of files is
+ * the count of judge calls. A per-task budget, when set, refuses the call that would exceed it.
+ */
+export async function judgeAnswer(work, cfg, task, answer, ask = httpAsk) {
+  const digest = sha(canonical(answer));
+  const dir = path.join(work, "judge");
+  const file = path.join(dir, `${safeName(task)}-${digest.slice(0, 16)}.json`);
+  if (fs.existsSync(file)) return { ...readJson(file), cached: true };
+  fs.mkdirSync(dir, { recursive: true });
+  const used = fs.readdirSync(dir).filter((f) => f.startsWith(`${safeName(task)}-`)).length;
+  if (cfg.budget_per_task !== null && used >= cfg.budget_per_task)
+    throw new Error(`judge budget for ${task} is spent (${used} of ${cfg.budget_per_task} calls)`);
+  const reply = await ask(cfg, task, answer);
+  const raw = cfg.score_path.split(".").reduce((v, k) => (v == null ? v : v[k]), reply);
+  if (typeof raw !== "number" || Number.isNaN(raw)) throw new Error(`judge reply has no numeric ${cfg.score_path}`);
+  const rec = { task, answer_sha: digest, score: round4(raw * cfg.scale), reply };
+  fs.writeFileSync(file, `${JSON.stringify(rec, null, 2)}\n`);
+  return { ...rec, cached: false };
+}
+
+export function judgeCalls(work) {
+  const dir = path.join(work, "judge");
+  const out = {};
+  if (!fs.existsSync(dir)) return out;
+  for (const f of fs.readdirSync(dir)) {
+    const task = readJson(path.join(dir, f)).task;
+    out[task] = (out[task] || 0) + 1;
+  }
+  return out;
+}
+
+/** Answer fields as dotted paths. Objects are walked; a list is one field. */
+export function leafPaths(value, prefix = "") {
+  const out = new Map();
+  if (!isObj(value)) return out;
+  for (const [k, v] of Object.entries(value)) {
+    const p = prefix ? `${prefix}.${k}` : k;
+    if (isObj(v) && Object.keys(v).length > 0) for (const [q, c] of leafPaths(v, p)) out.set(q, c);
+    else out.set(p, canonical(v));
+  }
+  return out;
+}
+
+export function changedPaths(a, b) {
+  const A = leafPaths(a);
+  const B = leafPaths(b);
+  return [...new Set([...A.keys(), ...B.keys()])].filter((p) => A.get(p) !== B.get(p)).sort();
+}
+
+function withoutPath(answer, p) {
+  const out = clone(answer);
+  const keys = p.split(".");
+  let cur = out;
+  for (const k of keys.slice(0, -1)) cur = cur[k];
+  delete cur[keys.at(-1)];
+  return out;
+}
+
+/**
+ * Knock-out map of one answer: remove one field at a time and judge again. A drop means the
+ * field earned credit. No change means it earned none: it is wrong, or it is not scored alone.
+ */
+export async function localize(work, cfg, task, answer, ask) {
+  const base = await judgeAnswer(work, cfg, task, answer, ask);
+  const credited = [];
+  const noCredit = [];
+  const penalized = [];
+  for (const p of leafPaths(answer).keys()) {
+    const s = (await judgeAnswer(work, cfg, task, withoutPath(answer, p), ask)).score;
+    if (s < base.score) credited.push({ path: p, delta: round4(s - base.score) });
+    else if (s > base.score) penalized.push({ path: p, delta: round4(s - base.score) });
+    else noCredit.push(p);
+  }
+  const rec = { task, answer_sha: base.answer_sha, score: base.score, credited, no_credit: noCredit, penalized };
+  const dir = path.join(work, "localize");
+  fs.mkdirSync(dir, { recursive: true });
+  fs.writeFileSync(
+    path.join(dir, `${safeName(task)}-${base.answer_sha.slice(0, 16)}.json`),
+    `${JSON.stringify(rec, null, 2)}\n`,
+  );
+  return rec;
+}
+
+/**
+ * Fields without credit, counted across tasks, most widespread first. An error that recurs
+ * across tasks is a fact about the domain; one seen in a single task may be that task's own.
+ * Uses each task's best-scoring localized answer.
+ */
+export function gaps(work) {
+  const dir = path.join(work, "localize");
+  const best = new Map();
+  if (fs.existsSync(dir)) {
+    for (const f of fs.readdirSync(dir).sort()) {
+      const rec = readJson(path.join(dir, f));
+      if (!best.has(rec.task) || rec.score > best.get(rec.task).score) best.set(rec.task, rec);
+    }
+  }
+  const byPath = new Map();
+  for (const rec of best.values()) {
+    for (const p of [...rec.no_credit, ...rec.penalized.map((x) => x.path)]) {
+      if (!byPath.has(p)) byPath.set(p, []);
+      byPath.get(p).push(rec.task);
+    }
+  }
+  return {
+    tasks: [...best.values()]
+      .map((r) => ({ task: r.task, score: r.score }))
+      .sort((a, b) => a.task.localeCompare(b.task)),
+    gaps: [...byPath.entries()]
+      .map(([p, tasks]) => ({ path: p, tasks: tasks.sort() }))
+      .sort((a, b) => b.tasks.length - a.tasks.length || a.path.localeCompare(b.path)),
+  };
+}
+
+const covers = (decides, p) => decides.some((d) => p === d || p.startsWith(`${d}.`) || d.startsWith(`${p}.`));
+const signed = (x) => `${x > 0 ? "+" : ""}${x}`;
+
+/**
+ * One experiment. `base` and `variant` are two answers to the same task that differ only in
+ * fields the tested elements decide. `predict` is fixed before the judge is asked:
+ *   better: the variant follows the rule and the base does not, so the variant must score higher;
+ *   worse:  the base follows the rule and the variant breaks it, so the variant must score lower.
+ * A score that moves as predicted confirms every tested element in this task. One that moves the
+ * other way refutes: a single tested element is retired; a bundle is only recorded, because the
+ * experiment cannot say which member is wrong. No movement is inconclusive.
+ * Without `tests` it is a plain comparison and changes nothing.
+ */
+export async function runExperiment(slot, work, cfg, spec, opts = {}) {
+  const { task, base, variant, predict } = spec;
+  const tests = spec.tests || [];
+  const { onto } = loadSlot(slot);
+  const els = tests.map((id) => onto.elements.find((e) => e.id === id));
+  tests.forEach((id, i) => {
+    if (!els[i] || els[i].status === "retired") throw new Error(`${id} is not a live element`);
+    if (!isPolicy(els[i].kind)) throw new Error(`${id} is structure; experiments test policy`);
+  });
+  if (tests.length && predict !== "better" && predict !== "worse") throw new Error("predict must be better or worse");
+  const changed = changedPaths(base, variant);
+  if (changed.length === 0) throw new Error("base and variant are the same answer");
+  if (tests.length) {
+    const decides = els.flatMap((e) => e.decides);
+    const stray = changed.filter((p) => !covers(decides, p));
+    if (stray.length)
+      throw new Error(`the variant also changes ${stray.join(", ")}, which the tested elements do not decide`);
+  }
+  const b = await judgeAnswer(work, cfg, task, base, opts.ask);
+  const v = await judgeAnswer(work, cfg, task, variant, opts.ask);
+  const delta = round4(v.score - b.score);
+  let outcome = "compared";
+  if (tests.length) {
+    const sign = predict === "better" ? delta : -delta;
+    outcome = sign > 0 ? "confirmed" : sign < 0 ? "refuted" : "inconclusive";
+  }
+  const file = path.join(work, "experiments.jsonl");
+  const id = `exp:${readJsonl(file).length + 1}`;
+  const rec = {
+    id,
+    task,
+    tests,
+    predict: tests.length ? predict : null,
+    changed,
+    base_sha: b.answer_sha,
+    variant_sha: v.answer_sha,
+    base_score: b.score,
+    variant_score: v.score,
+    delta,
+    outcome,
+    ...(spec.note ? { note: norm(spec.note) } : {}),
+  };
+  appendJsonl(file, rec);
+
+  const next = clone(onto);
+  next.version = onto.version + 1;
+  const lines = [];
+  const pick = (eid) => next.elements.find((e) => e.id === eid);
+  if (outcome === "confirmed") {
+    for (const eid of tests) {
+      const el = pick(eid);
+      el.evidence.push({ type: "experiment", id, task });
+      el.support = supportOf(el);
+      el.updated = next.version;
+      const promoted = el.status === "candidate";
+      el.status = "active";
+      lines.push(`CONFIRM ${eid} (${id}, ${signed(delta)})${promoted ? ": now active" : ""}`);
+    }
+  } else if (outcome === "refuted" && tests.length === 1) {
+    const el = pick(tests[0]);
+    el.counterexamples.push({ type: "experiment", id, task });
+    el.updated = next.version;
+    const by = referrersOf(el.id, next);
+    if (by.length) {
+      el.status = "candidate";
+      el.evidence = el.evidence.filter((ev) => ev.type !== "experiment");
+      el.support = supportOf(el);
+      lines.push(`REFUTE ${el.id} (${id}, ${signed(delta)}): back to hypothesis; ${by.join(", ")} refer to it`);
+    } else {
+      el.status = "retired";
+      el.retired_reason = `refuted by ${id}`;
+      lines.push(`REFUTE ${el.id} (${id}, ${signed(delta)}): retired`);
+    }
+  }
+  const result = { ...rec, published: false, version: onto.version };
+  if (lines.length === 0) return result;
+  const over = overBudget(next);
+  if (over)
+    return {
+      ...result,
+      reason: `${over}. The experiment is recorded; repeat it after consolidating (it costs no judge call)`,
+    };
+  publish(slot, next, lines, opts);
+  return { ...result, published: true, version: next.version, changes: lines };
 }
 
 // ---------------------------------------------------------------------------------------------
 // Validate a whole slot
 
-export function validateSlot(slot, corpus) {
+export function validateSlot(slot, corpus, work) {
   const errors = [];
   const warnings = [];
   let onto;
@@ -822,6 +1028,9 @@ export function validateSlot(slot, corpus) {
   if (!Number.isInteger(onto.version) || onto.version < 0) errors.push("version must be a non-negative integer");
   if (!Number.isInteger(onto.budget_tokens) || onto.budget_tokens <= 0) errors.push("budget_tokens must be positive");
   if (!Array.isArray(onto.elements)) return { ok: false, errors: [...errors, "elements must be a list"], warnings };
+  const experiments = work
+    ? new Map(readJsonl(path.join(work, "experiments.jsonl")).map((x) => [x.id, x]))
+    : null;
 
   const seen = new Set();
   for (const el of onto.elements) {
@@ -831,31 +1040,40 @@ export function validateSlot(slot, corpus) {
     seen.add(el.id);
     if (PREFIX_KIND[el.id?.[0]] !== el.kind) errors.push(`${where}: prefix does not match kind ${el.kind}`);
     if (!STATUSES.has(el.status)) errors.push(`${where}: bad status ${el.status}`);
-    if (!ORIGINS.has(el.origin)) errors.push(`${where}: bad origin ${el.origin}`);
-    if (!STRUCTURAL.has(el.kind) && el.origin === "observed") errors.push(`${where}: policy cannot be observed`);
     if (el.status === "retired") continue;
     for (const e of checkContent(el)) errors.push(`${where}: ${e}`);
     for (const e of refErrors(el, onto)) errors.push(`${where}: ${e}`);
     const quotes = (el.evidence || []).filter((ev) => ev.type === "quote");
+    const exps = (el.evidence || []).filter((ev) => ev.type === "experiment");
     if (quotes.length === 0) errors.push(`${where}: no quoted evidence`);
+    if (el.support !== supportOf(el)) errors.push(`${where}: support ${el.support} but evidence gives ${supportOf(el)}`);
+    if (isPolicy(el.kind)) {
+      if (el.status === "active" && exps.length === 0)
+        errors.push(`${where}: active policy without a confirming experiment`);
+    } else if (el.status !== "active") errors.push(`${where}: structure is active or retired`);
+    if (experiments) {
+      for (const ev of exps) {
+        const x = experiments.get(ev.id);
+        if (!x) errors.push(`${where}: ${ev.id} is not in experiments.jsonl`);
+        else if (x.outcome !== "confirmed" || !x.tests.includes(el.id) || x.task !== ev.task)
+          errors.push(`${where}: ${ev.id} does not confirm it`);
+      }
+    }
     if (corpus.sessions.size === 0) continue;
     for (const ev of quotes) {
       const err = checkQuote(corpus, ev);
       if (err) errors.push(`${where}: ${err}`);
     }
-    if (el.support !== supportOf(el)) errors.push(`${where}: support ${el.support} but evidence gives ${supportOf(el)}`);
-    if (el.status === "active" && !STRUCTURAL.has(el.kind)) {
-      const improved = el.evidence.some((ev) => ev.type === "use" && ev.improved === true);
-      if (el.support < 2 && !improved) errors.push(`${where}: active policy without two tasks or an improved retry`);
-    }
     const hits = forbiddenIn(el, corpus.forbidden);
     if (hits.length) errors.push(`${where}: instance ids in content: ${hits.join(", ")}`);
   }
   if (corpus.sessions.size === 0) warnings.push("no corpus given: quotes and instance ids were not checked");
+  if (!experiments) warnings.push("no work directory given: experiment evidence was not checked");
 
   const view = render(onto);
   const tokens = estimateTokens(view);
-  if (tokens > onto.budget_tokens) errors.push(`rendered view is ${tokens} tokens, over the budget of ${onto.budget_tokens}`);
+  if (tokens > onto.budget_tokens)
+    errors.push(`rendered view is ${tokens} tokens, over the budget of ${onto.budget_tokens}`);
   const mdPath = path.join(slot, "ONTOLOGY.md");
   if (!fs.existsSync(mdPath) || fs.readFileSync(mdPath, "utf8") !== view)
     errors.push("ONTOLOGY.md differs from the view rendered from ontology.json");
@@ -888,7 +1106,7 @@ export function initSlot(slot, opts = {}) {
   }
 }
 
-/** The deployable copy: reader, view, and ontology.json without provenance or retired elements. */
+/** The deployable copy: reader, view, and the active elements of ontology.json without provenance. */
 export function exportSlot(slot, dest) {
   const { onto } = loadSlot(slot);
   fs.mkdirSync(dest, { recursive: true });
@@ -897,7 +1115,7 @@ export function exportSlot(slot, dest) {
     version: onto.version,
     budget_tokens: onto.budget_tokens,
     elements: onto.elements
-      .filter((e) => e.status !== "retired")
+      .filter((e) => e.status === "active")
       .map((e) => {
         const { evidence, counterexamples, created, updated, merged_into, retired_reason, ...rest } = e;
         return rest;
@@ -1040,8 +1258,6 @@ function readUsed(file) {
   ];
 }
 
-const safeName = (s) => s.replace(/[^A-Za-z0-9_.-]/g, "_");
-
 export function writeCorpus(outDir, rec) {
   fs.mkdirSync(outDir, { recursive: true });
   const file = path.join(outDir, `${safeName(rec.session)}.json`);
@@ -1050,7 +1266,7 @@ export function writeCorpus(outDir, rec) {
 }
 
 // ---------------------------------------------------------------------------------------------
-// Diff and stats
+// Diff, stats and the run summary
 
 export function diffOntologies(a, b) {
   const A = new Map(a.elements.map((e) => [e.id, e]));
@@ -1064,8 +1280,7 @@ export function diffOntologies(a, b) {
     }
     if (ea.status !== "retired" && eb.status === "retired") out.retired.push(id);
     else if (ea.status === "candidate" && eb.status === "active") out.promoted.push(id);
-    else if (JSON.stringify(contentOf(ea)) !== JSON.stringify(contentOf(eb)) || ea.scope !== eb.scope)
-      out.changed.push(id);
+    else if (canonical(contentOf(ea)) !== canonical(contentOf(eb)) || ea.scope !== eb.scope) out.changed.push(id);
   }
   return out;
 }
@@ -1079,26 +1294,69 @@ export function stats(onto) {
   return { version: onto.version, tokens: estimateTokens(render(onto)), budget: onto.budget_tokens, counts };
 }
 
+/** What the run did, computed from its records, not written by hand. */
+export function summarize(slot, work) {
+  const phases = {};
+  for (const r of readJsonl(path.join(work, "records.jsonl"))) {
+    if (r.kind !== "attempt") continue;
+    phases[r.phase] ??= {};
+    phases[r.phase][r.task] = r.score; // the last attempt of a task in a phase
+  }
+  const mean = (o) => {
+    const v = Object.values(o);
+    return v.length ? Math.round((v.reduce((a, b) => a + b, 0) / v.length) * 100) / 100 : null;
+  };
+  const exps = readJsonl(path.join(work, "experiments.jsonl"));
+  const outcomes = {};
+  for (const x of exps) outcomes[x.outcome] = (outcomes[x.outcome] || 0) + 1;
+  const { onto } = loadSlot(slot);
+  return {
+    phase_scores: phases,
+    phase_means: Object.fromEntries(Object.entries(phases).map(([k, v]) => [k, mean(v)])),
+    experiments: { total: exps.length, ...outcomes },
+    refuted_before_deployment: onto.elements
+      .filter((e) => /^refuted by /.test(e.retired_reason || ""))
+      .map((e) => e.id),
+    judge_calls: judgeCalls(work),
+    ontology: stats(onto),
+  };
+}
+
 // ---------------------------------------------------------------------------------------------
 // CLI
 
 const HELP = `onto.mjs: deterministic tools of the Ontology RSI Toolkit (Node built-ins only)
 
+Slot
   init <slot> [--agents-md <AGENTS.md>] [--budget <tokens>]
       Create an empty learning slot; append the fixed reader line to AGENTS.md when given.
-  extract (--trace <file>... | --session <id> --agent-dir <agent dir>) --task <label> --out <corpus dir>
-          [--used <ontology-used.txt>] [--log <file>] [--clip <chars>]
-      Pull one Session's input and tool outputs into the corpus; print or save the condensed log.
-      Use --task probe for your own read-only probes: they never count as task support.
-  extract-judge --response <file> --task <label> --attempt <n> --out <corpus dir>
-      Add a training judge reply to the corpus as session judge:<task>:<n>.
-  apply <slot> <edits.json> --corpus <dir> [--snapshots <dir>] [--date YYYY-MM-DD] [--dry-run]
-      Apply typed edits (ADD REFINE SCOPE RETIRE MERGE SUPPORT); publish what passes.
-  validate <slot> [--corpus <dir>]      Check every invariant of a slot. Exit 1 on an error.
+  apply <slot> <edits.json> --corpus <dir> [--work <dir>] [--snapshots <dir>] [--dry-run]
+      Apply typed edits (ADD REFINE RETIRE MERGE); publish what passes.
+  validate <slot> [--corpus <dir>] [--work <dir>]   Check every invariant. Exit 1 on an error.
   render <slot>                         Rewrite ONTOLOGY.md from ontology.json.
-  export <slot> <dest>                  Write the deployable copy (no provenance) to dest.
+  export <slot> <dest>                  Write the deployable copy: active elements, no provenance.
   diff <a.json> <b.json>                Added, retired, promoted and changed ids.
   stats <slot>                          Counts per kind and status, and the token estimate.
+
+Observation
+  extract (--trace <file>... | --session <id> --agent-dir <agent dir>) --task <label> --out <corpus dir>
+          [--used <ontology-used.txt>] [--log <file>] [--clip <chars>]
+      Pull one Session's input and tool outputs into the corpus; save or print the condensed log.
+      Use --task probe for your own read-only probes.
+
+Experiment (each needs --config <file with the judge settings> and --work <dir>)
+  judge --task <id> --answer <file> [--phase <name> --session <id>]
+      Score an answer. With --phase it is recorded as that task's attempt in that phase.
+  localize --task <id> --answer <file>
+      Remove one answer field at a time and judge again: which fields earn credit, which do not.
+  gaps --work <dir>
+      Fields without credit across tasks, most widespread first.
+  experiment <slot> --task <id> --base <file> --variant <file>
+             [--tests <element id>... --predict better|worse] [--note <text>] [--snapshots <dir>]
+      Judge two answers that differ only in fields the tested elements decide. The prediction is
+      fixed here, before the judge is asked. Confirmed: the elements become active. Refuted: a
+      single tested element is retired. Without --tests it only compares.
+  summary <slot> --work <dir>           Phase means, experiments, judge calls, ontology counts.
 
 Every command prints JSON on stdout.`;
 
@@ -1120,9 +1378,17 @@ function parseArgs(argv) {
 const list = (v) => (v === undefined || v === true ? [] : Array.isArray(v) ? v : [v]);
 const print = (v) => process.stdout.write(`${JSON.stringify(v, null, 2)}\n`);
 
-export function main(argv) {
+export async function main(argv, hooks = {}) {
   const [cmd, ...rest] = argv;
   const { pos, flags } = parseArgs(rest);
+  const str = (k) => (typeof flags[k] === "string" ? flags[k] : undefined);
+  const need = (k) => {
+    if (str(k) === undefined) throw new Error(`${cmd} needs --${k}`);
+    return str(k);
+  };
+  const record = (rec) => {
+    if (str("work")) appendJsonl(path.join(str("work"), "records.jsonl"), { time: new Date().toISOString(), ...rec });
+  };
   if (!cmd || cmd === "--help" || cmd === "-h" || cmd === "help") {
     process.stdout.write(`${HELP}\n`);
     return 0;
@@ -1131,84 +1397,129 @@ export function main(argv) {
     case "init": {
       if (!pos[0]) throw new Error("init needs <slot>");
       initSlot(pos[0], {
-        agentsMd: typeof flags["agents-md"] === "string" ? flags["agents-md"] : undefined,
+        agentsMd: str("agents-md"),
         budget: flags.budget ? Number(flags.budget) : undefined,
-        date: typeof flags.date === "string" ? flags.date : undefined,
+        date: str("date"),
       });
       print({ ok: true, slot: pos[0] });
       return 0;
     }
     case "extract": {
-      if (typeof flags.task !== "string") throw new Error("extract needs --task");
-      if (typeof flags.out !== "string") throw new Error("extract needs --out");
+      const task = need("task");
+      const out = need("out");
       let files = list(flags.trace);
-      const session = typeof flags.session === "string" ? flags.session : undefined;
+      const session = str("session");
       if (files.length === 0) {
-        if (!session || typeof flags["agent-dir"] !== "string") throw new Error("extract needs --trace or --session with --agent-dir");
-        files = traceFiles(flags["agent-dir"], session);
+        if (!session || !str("agent-dir")) throw new Error("extract needs --trace or --session with --agent-dir");
+        files = traceFiles(str("agent-dir"), session);
         if (files.length === 0) throw new Error(`no Trace files for session ${session}`);
       }
-      const clip = flags.clip ? Number(flags.clip) : 1500;
-      const x = extractTrace(files, { session, clip });
+      const x = extractTrace(files, { session, clip: flags.clip ? Number(flags.clip) : 1500 });
       const rec = {
         session: x.session,
-        task: flags.task,
+        task,
         kind: "trace",
         files,
-        used: readUsed(typeof flags.used === "string" ? flags.used : undefined),
+        used: readUsed(str("used")),
         instance_ids: x.instance_ids,
-        subject_ids: flags.task === PROBE_TASK ? [] : x.subject_ids,
+        subject_ids: task === PROBE_TASK ? [] : x.subject_ids,
         sources: x.sources,
       };
-      const file = writeCorpus(flags.out, rec);
+      const file = writeCorpus(out, rec);
       const logText = `${x.log.join("\n")}\n`;
-      if (typeof flags.log === "string") fs.writeFileSync(flags.log, logText);
+      if (str("log")) fs.writeFileSync(str("log"), logText);
       print({
         ok: true,
         session: rec.session,
-        task: rec.task,
+        task,
         corpus_file: file,
         sources: rec.sources.length,
         used: rec.used,
         instance_ids: rec.instance_ids.length,
         subject_ids: rec.subject_ids,
-        log: typeof flags.log === "string" ? flags.log : logText,
+        log: str("log") ?? logText,
       });
-      return 0;
-    }
-    case "extract-judge": {
-      for (const k of ["response", "task", "attempt", "out"])
-        if (typeof flags[k] !== "string") throw new Error(`extract-judge needs --${k}`);
-      const text = fs.readFileSync(flags.response, "utf8");
-      const rec = {
-        session: `judge:${flags.task}:${flags.attempt}`,
-        task: flags.task,
-        kind: "judge",
-        files: [flags.response],
-        used: [],
-        instance_ids: [],
-        subject_ids: [],
-        sources: [{ type: "judge", text }],
-      };
-      print({ ok: true, session: rec.session, corpus_file: writeCorpus(flags.out, rec) });
       return 0;
     }
     case "apply": {
       const [slot, editsFile] = pos;
       if (!slot || !editsFile) throw new Error("apply needs <slot> <edits.json>");
-      if (typeof flags.corpus !== "string") throw new Error("apply needs --corpus");
-      const corpus = loadCorpus(flags.corpus);
-      const r = applyEdits(slot, readJson(editsFile), corpus, {
-        snapshots: typeof flags.snapshots === "string" ? flags.snapshots : undefined,
-        date: typeof flags.date === "string" ? flags.date : undefined,
+      const r = applyEdits(slot, readJson(editsFile), loadCorpus(need("corpus")), {
+        snapshots: str("snapshots"),
+        date: str("date"),
         dryRun: flags["dry-run"] === true,
+      });
+      record({
+        kind: "apply",
+        edits: editsFile,
+        published: r.published,
+        version: r.version,
+        applied: r.applied.length,
+        rejected: r.rejected,
+      });
+      print(r);
+      return 0;
+    }
+    case "judge": {
+      const work = need("work");
+      const task = need("task");
+      const r = await judgeAnswer(work, loadJudgeConfig(need("config")), task, readJson(need("answer")), hooks.ask);
+      if (str("phase"))
+        record({
+          kind: "attempt",
+          phase: str("phase"),
+          task,
+          session: str("session"),
+          answer: str("answer"),
+          answer_sha: r.answer_sha,
+          score: r.score,
+        });
+      print({ task, score: r.score, cached: r.cached, answer_sha: r.answer_sha });
+      return 0;
+    }
+    case "localize": {
+      const work = need("work");
+      const r = await localize(work, loadJudgeConfig(need("config")), need("task"), readJson(need("answer")), hooks.ask);
+      record({ kind: "localize", task: r.task, answer_sha: r.answer_sha, score: r.score, no_credit: r.no_credit });
+      print(r);
+      return 0;
+    }
+    case "gaps": {
+      print(gaps(need("work")));
+      return 0;
+    }
+    case "experiment": {
+      if (!pos[0]) throw new Error("experiment needs <slot>");
+      const work = need("work");
+      const r = await runExperiment(
+        pos[0],
+        work,
+        loadJudgeConfig(need("config")),
+        {
+          task: need("task"),
+          base: readJson(need("base")),
+          variant: readJson(need("variant")),
+          tests: list(flags.tests),
+          predict: str("predict"),
+          note: str("note"),
+        },
+        { snapshots: str("snapshots"), date: str("date"), ask: hooks.ask },
+      );
+      record({
+        kind: "experiment",
+        id: r.id,
+        task: r.task,
+        tests: r.tests,
+        outcome: r.outcome,
+        delta: r.delta,
+        version: r.version,
       });
       print(r);
       return 0;
     }
     case "validate": {
       if (!pos[0]) throw new Error("validate needs <slot>");
-      const r = validateSlot(pos[0], loadCorpus(typeof flags.corpus === "string" ? flags.corpus : undefined));
+      const r = validateSlot(pos[0], loadCorpus(str("corpus")), str("work"));
       print(r);
       return r.ok ? 0 : 1;
     }
@@ -1236,6 +1547,14 @@ export function main(argv) {
       print(stats(loadSlot(pos[0]).onto));
       return 0;
     }
+    case "summary": {
+      if (!pos[0]) throw new Error("summary needs <slot>");
+      const work = need("work");
+      const s = summarize(pos[0], work);
+      fs.writeFileSync(path.join(work, "summary.json"), `${JSON.stringify(s, null, 2)}\n`);
+      print(s);
+      return 0;
+    }
     default:
       throw new Error(`unknown command ${cmd}; see --help`);
   }
@@ -1243,10 +1562,13 @@ export function main(argv) {
 
 const invoked = process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url);
 if (invoked) {
-  try {
-    process.exitCode = main(process.argv.slice(2));
-  } catch (e) {
-    process.stderr.write(`onto.mjs: ${e.message}\n`);
-    process.exitCode = 2;
-  }
+  main(process.argv.slice(2)).then(
+    (code) => {
+      process.exitCode = code;
+    },
+    (e) => {
+      process.stderr.write(`onto.mjs: ${e.message}\n`);
+      process.exitCode = 2;
+    },
+  );
 }

@@ -53,7 +53,7 @@ Copy the base into a separate Ontologist State and install:
 | Public benchmark training brief | `skills/ontology-training/benchmark-training.md` |
 | Resolved run configuration | `training-request.json` |
 
-The brief gives the public task and input paths, API and tool access, the judge call and how to read its reply, score interpretation, state reset semantics, and the export paths for answers, the Skill and records. Derive these from the selected benchmark, not from hard-coded group paths. Confirm that the training judge is enabled; a reachable business API alone is not enough.
+The brief gives the public task and input paths, API and tool access, the judge call and how to read its reply, score interpretation, state reset semantics, the export paths for answers, the Skill and records, and where the Node.js that runs PenguinHarness is when `node` is not on the task image's PATH. Derive these from the selected benchmark, not from hard-coded group paths. Confirm that the training judge is enabled; a reachable business API alone is not enough.
 
 `training-request.json`, with every path resolvable inside the container:
 
@@ -63,12 +63,17 @@ The brief gives the public task and input paths, API and tool access, the judge 
   "benchmark_id": "<train package id>",
   "unit": "<training unit id>",
   "tasks": ["train_001", "train_002", "train_003", "train_004", "train_005"],
-  "passes": 2,
   "budget_tokens": 6000,
-  "edit_repairs": 1,
   "selection": "final",
   "time_budget_minutes": 360,
   "reserve_minutes": 30,
+  "judge": {
+    "url": "<the training judge endpoint>",
+    "body": { "task_id": "{task}", "answer": "{answer}" },
+    "score_path": "score",
+    "scale": 100,
+    "budget_per_task": 150
+  },
   "actor": {
     "agent_id": "<actor id>",
     "project_id": "<project id in the container>",
@@ -85,7 +90,9 @@ The brief gives the public task and input paths, API and tool access, the judge 
 }
 ```
 
-The request names no held-out material and no test repetitions; those belong to the Organizer's schedule. Add to the Ontologist's `AGENTS.md`:
+`judge` tells `onto.mjs` how to ask the benchmark's training judge. In `body`, the string `{task}` becomes the task id and `{answer}` the answer object; `score_path` is where the score sits in the reply, and `scale` brings it to 0–100. `budget_per_task` caps the distinct answers judged per task. Take the endpoint and reply shape from the benchmark's own instructions.
+
+The request names no held-out material and no test repetitions; those belong to the Organizer's schedule. Replace the Ontologist's `AGENTS.md` (it does not solve tasks, so the base's solving instruction does not apply) with:
 
 ```text
 For this whole training run, read training-request.json beside this file,

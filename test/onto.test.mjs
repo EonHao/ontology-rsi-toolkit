@@ -1,23 +1,32 @@
-// Tests of the deterministic toolkit script. Run: node --test test/
+// Tests of the deterministic toolkit script. Run: node --test "test/*.test.mjs"
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
+import http from "node:http";
 import os from "node:os";
 import path from "node:path";
-import { spawnSync } from "node:child_process";
+import { execFile } from "node:child_process";
+import { promisify } from "node:util";
 import { fileURLToPath } from "node:url";
 import {
   AGENTS_LINE,
   READER_BODY,
   applyEdits,
+  changedPaths,
   diffOntologies,
+  exportSlot,
   extractTrace,
+  gaps,
   initSlot,
+  judgeAnswer,
+  judgeCalls,
+  leafPaths,
   loadCorpus,
   loadSlot,
+  localize,
   nextSkillVersion,
-  exportSlot,
-  render,
+  runExperiment,
+  summarize,
   traceFiles,
   validateSlot,
   writeCorpus,
@@ -25,9 +34,10 @@ import {
 
 const SCRIPT = fileURLToPath(new URL("../skills/ontology-rsi-toolkit/scripts/onto.mjs", import.meta.url));
 const DATE = "2026-11-12";
+const run = promisify(execFile);
 
 // ---------------------------------------------------------------------------------------------
-// Fixtures: two Actor Sessions on two training tasks of one payer domain.
+// Fixtures: two Actor Sessions on two training tasks of one payer domain, and a judge.
 
 const j = (v) => JSON.stringify(v, null, 2);
 const POLICY = {
@@ -48,9 +58,12 @@ function trace(session, userText, calls, finalText) {
     });
   });
   // A nested subagent record must be ignored.
-  recs.push({ type: "model_msg", origin: ["child"], payload: { type: "tool_call_output", tool_call_id: "z", output: "NESTED-999 secret" } });
+  recs.push({
+    type: "model_msg",
+    origin: ["child"],
+    payload: { type: "tool_call_output", tool_call_id: "z", output: "NESTED-999 secret" },
+  });
   recs.push({ type: "model_msg", payload: { type: "text", role: "assistant", text: finalText } });
-  recs.push({ type: "event_msg", payload: { type: "request_end", status: "completed" } });
   return recs.map((r) => JSON.stringify(r)).join("\n") + "\n";
 }
 
@@ -68,11 +81,7 @@ function fixture() {
         [
           "exec_command",
           '{"cmd":"curl -s -X POST /sql/query"}',
-          j({
-            columns: ["claim_id", "status", "member_id"],
-            rows: [{ claim_id: "CLM-1001", status: "approved", member_id: "M-0077" }],
-            row_count: 1,
-          }),
+          j({ rows: [{ claim_id: "CLM-1001", status: "approved", member_id: "M-0077" }], row_count: 1 }),
         ],
         [
           "exec_command",
@@ -101,26 +110,26 @@ function fixture() {
       "Pending claims cannot be paid.",
     ),
   );
-  const scratch = path.join(agentDir, "scratchpad", "s2");
-  fs.mkdirSync(scratch, { recursive: true });
-  fs.writeFileSync(path.join(scratch, "ontology-used.txt"), "A.approve_payment\nP.policy_text_wins\nnot an id\n");
-  const corpusDir = path.join(root, "corpus");
-  const slot = path.join(root, "state", "skills", "domain-ontology");
-  return { root, agentDir, corpusDir, slot, scratch };
+  return {
+    root,
+    agentDir,
+    corpusDir: path.join(root, "work", "corpus"),
+    work: path.join(root, "work"),
+    slot: path.join(root, "work", "slot"),
+  };
 }
 
 function extractAll(fx) {
-  for (const [session, task, used] of [
-    ["s1", "train_001", undefined],
-    ["s2", "train_002", path.join(fx.scratch, "ontology-used.txt")],
+  for (const [session, task] of [
+    ["s1", "train_001"],
+    ["s2", "train_002"],
   ]) {
     const x = extractTrace(traceFiles(fx.agentDir, session), { session, clip: 1500 });
-    const usedIds = used ? fs.readFileSync(used, "utf8").split("\n").filter((s) => /^[A-Z]\.[A-Za-z]/.test(s)) : [];
     writeCorpus(fx.corpusDir, {
       session,
       task,
       kind: "trace",
-      used: usedIds,
+      used: [],
       instance_ids: x.instance_ids,
       subject_ids: x.subject_ids,
       sources: x.sources,
@@ -129,23 +138,49 @@ function extractAll(fx) {
   return loadCorpus(fx.corpusDir);
 }
 
+// The judge: three equally weighted items per task. `audit` is one item, right only as a whole.
+const GOLD = {
+  train_001: { decision: "deny", hold_reason: "void_bill", audit: { rule: "policy_first", order: ["claim", "bill"] } },
+  train_002: { decision: "deny", hold_reason: "pending", audit: { rule: "policy_first", order: ["claim"] } },
+};
+const CFG = { url: "http://judge.invalid", body: { task_id: "{task}", answer: "{answer}" }, score_path: "score", scale: 100, budget_per_task: null };
+let asked = 0;
+async function ask(_cfg, task, answer) {
+  asked += 1;
+  const g = GOLD[task];
+  const right = ["decision", "hold_reason", "audit"].filter((k) => JSON.stringify(answer[k]) === JSON.stringify(g[k])).length;
+  return { score: right / 3, correct: right === 3 };
+}
+// What the Actor answered: the decision is wrong in task 1, the audit trail in both.
+const BASE = {
+  train_001: { decision: "pay", hold_reason: "void_bill", audit: { rule: "claim_first", order: ["bill", "claim"] } },
+  train_002: { decision: "deny", hold_reason: "pending", audit: { rule: "claim_first", order: ["claim"] } },
+};
+
 const CLAIM = {
   id: "E.Claim",
   kind: "entity",
   name: "Claim",
   source: ["table claims (POST /sql/query)"],
   key: "claim_id",
-  fields: { status: "claim decision", member_id: "owning member" },
   enums: { status: ["approved", "pending"] },
 };
 const BILL = { id: "E.Bill", kind: "entity", name: "Bill", source: ["GET /api/bills"], key: "bill_id" };
 const PAY = {
-  id: "A.approve_payment",
+  id: "A.release_payment",
   kind: "action",
-  name: "approve payment",
+  decides: ["decision"],
+  name: "release payment",
   params: { claim: "E.Claim" },
   preconditions: ["claim.status == approved", "no linked E.Bill has state void"],
   requires_evidence: ["E.Bill"],
+};
+const AUDIT = {
+  id: "P.policy_first",
+  kind: "precedence",
+  decides: ["audit"],
+  prefer: "the governing policy text",
+  over: "the claim's own status",
 };
 const q1Claim = { session: "s1", quote: '"status": "approved"' };
 const q1Bill = { session: "s1", quote: '"state": "void"' };
@@ -162,6 +197,7 @@ function seeded() {
       { op: "ADD", element: CLAIM, evidence: [q1Claim] },
       { op: "ADD", element: BILL, evidence: [q1Bill] },
       { op: "ADD", element: PAY, evidence: [q1Policy] },
+      { op: "ADD", element: AUDIT, evidence: [q1Policy] },
     ],
     corpus,
     { date: DATE },
@@ -170,25 +206,28 @@ function seeded() {
   return { fx, corpus };
 }
 
+const el = (fx, id) => loadSlot(fx.slot).onto.elements.find((e) => e.id === id);
+const view = (fx) => fs.readFileSync(path.join(fx.slot, "ONTOLOGY.md"), "utf8");
+const exp = (fx, spec) => runExperiment(fx.slot, fx.work, CFG, spec, { ask, date: DATE });
+
 // ---------------------------------------------------------------------------------------------
 
-test("init creates the slot, the reader line is appended once", () => {
+test("init creates the slot; the reader line is appended once", () => {
   const fx = fixture();
   const agents = path.join(fx.root, "state", "AGENTS.md");
   fs.mkdirSync(path.dirname(agents), { recursive: true });
   fs.writeFileSync(agents, "# Agent\n\nBe careful.");
   initSlot(fx.slot, { date: DATE, agentsMd: agents });
-  for (const f of ["SKILL.md", "ontology.json", "ONTOLOGY.md", "CHANGELOG.md"]) assert.ok(fs.existsSync(path.join(fx.slot, f)), f);
+  for (const f of ["SKILL.md", "ontology.json", "ONTOLOGY.md", "CHANGELOG.md"])
+    assert.ok(fs.existsSync(path.join(fx.slot, f)), f);
   const { skill, onto } = loadSlot(fx.slot);
   assert.equal(skill.front.name, "domain-ontology");
   assert.equal(skill.front.version, "2026.11.12.1");
   assert.equal(skill.body, READER_BODY);
   assert.equal(onto.elements.length, 0);
-  // Idempotent reader line.
   fs.rmSync(fx.slot, { recursive: true });
   initSlot(fx.slot, { date: DATE, agentsMd: agents });
-  const lines = fs.readFileSync(agents, "utf8").split("\n").filter((l) => l === AGENTS_LINE);
-  assert.equal(lines.length, 1);
+  assert.equal(fs.readFileSync(agents, "utf8").split("\n").filter((l) => l === AGENTS_LINE).length, 1);
   assert.throws(() => initSlot(fx.slot, { date: DATE }), /not empty/);
   const v = validateSlot(fx.slot, loadCorpus(undefined));
   assert.equal(v.ok, true, v.errors.join("; "));
@@ -197,254 +236,352 @@ test("init creates the slot, the reader line is appended once", () => {
 test("extract keeps user input and tool outputs, drops model text and nested records", () => {
   const fx = fixture();
   const x = extractTrace(traceFiles(fx.agentDir, "s1"), { session: "s1", clip: 50 });
-  assert.equal(x.session, "s1");
   assert.deepEqual(
     x.sources.map((s) => s.type),
     ["user", "tool_output", "tool_output", "tool_output", "tool_output"],
   );
-  assert.ok(!x.sources.some((s) => s.text.includes("so it can be paid")), "assistant text is not evidence");
+  assert.ok(!x.sources.some((s) => s.text.includes("so it can be paid")), "model text is not evidence");
   assert.ok(!x.sources.some((s) => s.text.includes("NESTED-999")), "nested records are skipped");
   assert.deepEqual(x.instance_ids, ["B-0501", "CLM-1001", "M-0077", "POL-12"]);
   assert.deepEqual(x.subject_ids, ["CLM-1001"]);
-  assert.ok(x.log.some((l) => l.includes("· failed")), "failed calls are marked in the log");
-  assert.ok(x.log.some((l) => l.includes("more characters in the corpus")), "long outputs are clipped in the log");
+  assert.ok(x.log.some((l) => l.includes("· failed")));
+  assert.ok(x.log.some((l) => l.includes("more characters in the corpus")));
 });
 
 test("the barrier forbids single-task ids and task subjects, allows shared reference ids", () => {
-  const fx = fixture();
-  const corpus = extractAll(fx);
+  const corpus = extractAll(fixture());
   assert.equal(corpus.forbidden.get("CLM-1001"), "named in a task's input");
   assert.equal(corpus.forbidden.get("B-0501"), "record id seen in a single task");
   assert.equal(corpus.forbidden.get("train_001"), "task label");
   assert.equal(corpus.forbidden.has("POL-12"), false, "a policy seen in two tasks is domain data");
 });
 
-test("structure starts active, policy starts as a candidate", () => {
+test("structure is published at once; policy is a hypothesis the Actor never sees", () => {
   const { fx } = seeded();
-  const { onto } = loadSlot(fx.slot);
-  const byId = Object.fromEntries(onto.elements.map((e) => [e.id, e]));
-  assert.equal(byId["E.Claim"].status, "active");
-  assert.equal(byId["E.Claim"].origin, "observed");
-  assert.equal(byId["A.approve_payment"].status, "candidate");
-  assert.equal(byId["A.approve_payment"].support, 1);
-  assert.equal(onto.version, 1);
-  const md = fs.readFileSync(path.join(fx.slot, "ONTOLOGY.md"), "utf8");
-  assert.match(md, /### A\.approve_payment · candidate · support 1 · verify against data first/);
-  assert.match(md, /- Requires: claim\.status == approved/);
+  assert.equal(el(fx, "E.Claim").status, "active");
+  assert.equal(el(fx, "A.release_payment").status, "candidate");
+  assert.equal(el(fx, "A.release_payment").support, 0, "a quote is not support for a rule");
+  assert.match(view(fx), /### E\.Claim/);
+  assert.ok(!view(fx).includes("A.release_payment"), "hypotheses are not rendered");
+  const dest = path.join(fx.root, "skill");
+  exportSlot(fx.slot, dest);
+  const lean = JSON.parse(fs.readFileSync(path.join(dest, "ontology.json"), "utf8"));
+  assert.deepEqual(lean.elements.map((e) => e.id).sort(), ["E.Bill", "E.Claim"]);
+  assert.ok(lean.elements.every((e) => e.evidence === undefined));
+  assert.deepEqual(fs.readdirSync(dest).sort(), ["ONTOLOGY.md", "SKILL.md", "ontology.json"]);
   const log = fs.readFileSync(path.join(fx.slot, "CHANGELOG.md"), "utf8");
-  assert.match(log, /## v1 · 2026-11-12/);
+  assert.match(log, /ADD A\.release_payment \(action, hypothesis\)/);
   assert.ok(!log.includes("approved claim and no void"), "the changelog carries no quotes");
-  assert.equal(loadSlot(fx.slot).skill.front.version, "2026.11.12.2");
 });
 
-test("rejections: bad quote, instance id, observed policy, unknown reference, reused id", () => {
+test("rejections: bad quote, instance id, missing decides, unknown reference, reused id, old ops", () => {
   const { fx, corpus } = seeded();
   const r = applyEdits(
     fx.slot,
     [
-      { op: "ADD", element: { ...BILL, id: "E.Payment", name: "Payment" }, evidence: [{ session: "s1", quote: "a sentence nobody said" }] },
+      { op: "ADD", element: { ...BILL, id: "E.Payment" }, evidence: [{ session: "s1", quote: "a sentence nobody said" }] },
       {
         op: "ADD",
-        element: { id: "C.no_double_pay", kind: "constraint", rule: "CLM-1001 must not be paid twice" },
+        element: { id: "C.once", kind: "constraint", decides: ["decision"], rule: "CLM-1001 must not be paid twice" },
         evidence: [q1Policy],
       },
-      { op: "ADD", element: { id: "P.fresh", kind: "precedence", origin: "observed", prefer: "a", over: "b" }, evidence: [q1Policy] },
+      { op: "ADD", element: { id: "C.twice", kind: "constraint", rule: "a claim is paid at most once" }, evidence: [q1Policy] },
       { op: "ADD", element: { ...PAY, id: "A.hold", requires_evidence: ["E.Ghost"] }, evidence: [q1Policy] },
       { op: "ADD", element: CLAIM, evidence: [q1Claim] },
       { op: "ADD", element: { ...BILL, id: "E.Bx" }, evidence: [{ session: "s1", quote: "short" }] },
+      { op: "SUPPORT", id: "A.release_payment", session: "s2", quote: q2Policy.quote },
     ],
     corpus,
     { date: DATE },
   );
   assert.equal(r.published, false);
-  assert.equal(r.rejected.length, 6);
-  assert.match(r.rejected[0].reason, /not found verbatim/);
-  assert.match(r.rejected[1].reason, /instance ids in content: CLM-1001/);
-  assert.match(r.rejected[2].reason, /policy/);
-  assert.match(r.rejected[3].reason, /E\.Ghost/);
-  assert.match(r.rejected[4].reason, /exists/);
-  assert.match(r.rejected[5].reason, /shorter/);
+  const reasons = r.rejected.map((x) => x.reason);
+  assert.match(reasons[0], /not found verbatim/);
+  assert.match(reasons[1], /instance ids in content: CLM-1001/);
+  assert.match(reasons[2], /needs decides/);
+  assert.match(reasons[3], /E\.Ghost/);
+  assert.match(reasons[4], /exists/);
+  assert.match(reasons[5], /shorter/);
+  assert.match(reasons[6], /unknown op SUPPORT/);
 });
 
-test("a second task's quote promotes a candidate; shared ids may be named", () => {
+test("the judge is asked once per distinct answer, and a budget stops it", async () => {
+  const fx = fixture();
+  const before = asked;
+  const a = await judgeAnswer(fx.work, CFG, "train_001", BASE.train_001, ask);
+  const b = await judgeAnswer(fx.work, CFG, "train_001", { ...BASE.train_001 }, ask);
+  assert.equal(a.score, 33.3333);
+  assert.equal(a.cached, false);
+  assert.equal(b.cached, true);
+  assert.equal(asked - before, 1);
+  assert.deepEqual(judgeCalls(fx.work), { train_001: 1 });
+  await assert.rejects(
+    judgeAnswer(fx.work, { ...CFG, budget_per_task: 1 }, "train_001", GOLD.train_001, ask),
+    /judge budget for train_001 is spent/,
+  );
+});
+
+test("localize finds the fields without credit; gaps ranks the ones that recur across tasks", async () => {
+  const fx = fixture();
+  assert.deepEqual([...leafPaths(BASE.train_001).keys()], ["decision", "hold_reason", "audit.rule", "audit.order"]);
+  const l1 = await localize(fx.work, CFG, "train_001", BASE.train_001, ask);
+  assert.deepEqual(l1.credited.map((c) => c.path), ["hold_reason"]);
+  assert.deepEqual(l1.no_credit, ["decision", "audit.rule", "audit.order"]);
+  await localize(fx.work, CFG, "train_002", BASE.train_002, ask);
+  const g = gaps(fx.work);
+  assert.deepEqual(g.gaps[0], { path: "audit.order", tasks: ["train_001", "train_002"] });
+  assert.deepEqual(g.gaps[1], { path: "audit.rule", tasks: ["train_001", "train_002"] });
+  assert.deepEqual(g.gaps[2], { path: "decision", tasks: ["train_001"] });
+});
+
+test("an experiment that moves as predicted makes a hypothesis active", async () => {
   const { fx, corpus } = seeded();
-  const r = applyEdits(
-    fx.slot,
-    [
-      { op: "SUPPORT", id: "A.approve_payment", session: "s2", quote: q2Policy.quote },
-      { op: "REFINE", id: "A.approve_payment", set: { description: "Governed by policy POL-12." }, evidence: [q2Policy] },
-    ],
-    corpus,
-    { date: DATE },
-  );
-  assert.equal(r.published, true, JSON.stringify(r.rejected));
-  const pay = loadSlot(fx.slot).onto.elements.find((e) => e.id === "A.approve_payment");
-  assert.equal(pay.status, "active");
-  assert.equal(pay.support, 2);
-  assert.match(r.applied[0].summary, /1 → 2, now active/);
+  const variant = { ...BASE.train_001, decision: "deny" };
+  assert.deepEqual(changedPaths(BASE.train_001, variant), ["decision"]);
+  const r = await exp(fx, { task: "train_001", base: BASE.train_001, variant, tests: ["A.release_payment"], predict: "better" });
+  assert.equal(r.outcome, "confirmed");
+  assert.equal(r.delta, 33.3334);
+  assert.equal(r.published, true);
+  assert.equal(el(fx, "A.release_payment").status, "active");
+  assert.equal(el(fx, "A.release_payment").support, 1);
+  assert.match(view(fx), /### A\.release_payment · confirmed in 1 task\nDecides: decision/);
+  // The other direction: the base follows the rule, the variant breaks it.
+  const r2 = await exp(fx, {
+    task: "train_002",
+    base: BASE.train_002,
+    variant: { ...BASE.train_002, decision: "pay" },
+    tests: ["A.release_payment"],
+    predict: "worse",
+  });
+  assert.equal(r2.outcome, "confirmed");
+  assert.equal(el(fx, "A.release_payment").support, 2);
+  assert.match(view(fx), /confirmed in 2 tasks/);
+  const v = validateSlot(fx.slot, corpus, fx.work);
+  assert.equal(v.ok, true, v.errors.join("; "));
 });
 
-test("a declared use that improves a retry promotes; a low-scoring use is not support", () => {
+test("a refuted hypothesis is retired before it reaches the Actor", async () => {
+  const { fx } = seeded();
+  // The rule would turn a right answer wrong.
+  const r = await exp(fx, {
+    task: "train_002",
+    base: BASE.train_002,
+    variant: { ...BASE.train_002, decision: "pay" },
+    tests: ["A.release_payment"],
+    predict: "better",
+  });
+  assert.equal(r.outcome, "refuted");
+  assert.equal(el(fx, "A.release_payment").status, "retired");
+  assert.equal(el(fx, "A.release_payment").retired_reason, "refuted by exp:1");
+  assert.ok(!view(fx).includes("A.release_payment"));
+  await assert.rejects(
+    exp(fx, { task: "train_001", base: BASE.train_001, variant: GOLD.train_001, tests: ["A.release_payment"], predict: "better" }),
+    /not a live element/,
+  );
+  assert.deepEqual(summarize(fx.slot, fx.work).refuted_before_deployment, ["A.release_payment"]);
+});
+
+test("experiments: stray fields are refused, no movement is inconclusive, a jointly scored section needs the whole variant", async () => {
+  const { fx } = seeded();
+  await assert.rejects(
+    exp(fx, {
+      task: "train_001",
+      base: BASE.train_001,
+      variant: { ...BASE.train_001, decision: "deny", hold_reason: "x" },
+      tests: ["A.release_payment"],
+      predict: "better",
+    }),
+    /also changes hold_reason/,
+  );
+  await assert.rejects(
+    exp(fx, { task: "train_001", base: BASE.train_001, variant: BASE.train_001, tests: ["A.release_payment"], predict: "better" }),
+    /same answer/,
+  );
+  await assert.rejects(
+    exp(fx, { task: "train_001", base: BASE.train_001, variant: GOLD.train_001, tests: ["E.Claim"], predict: "better" }),
+    /experiments test policy/,
+  );
+  // Half of the audit section right: the judge scores it as a whole, so nothing moves.
+  const half = { ...BASE.train_001, audit: { rule: "policy_first", order: ["bill", "claim"] } };
+  const r1 = await exp(fx, { task: "train_001", base: BASE.train_001, variant: half, tests: ["P.policy_first"], predict: "better" });
+  assert.equal(r1.outcome, "inconclusive");
+  assert.equal(r1.published, false);
+  assert.equal(el(fx, "P.policy_first").status, "candidate");
+  const whole = { ...BASE.train_001, audit: GOLD.train_001.audit };
+  const r2 = await exp(fx, { task: "train_001", base: BASE.train_001, variant: whole, tests: ["P.policy_first"], predict: "better" });
+  assert.equal(r2.outcome, "confirmed");
+  // Without --tests it only compares.
+  const r3 = await exp(fx, { task: "train_001", base: BASE.train_001, variant: GOLD.train_001 });
+  assert.equal(r3.outcome, "compared");
+  assert.equal(r3.delta, 66.6667);
+  assert.equal(r3.published, false);
+});
+
+test("a bundle is confirmed together; a refuted bundle retires nobody", async () => {
+  const { fx } = seeded();
+  const both = { ...BASE.train_001, decision: "deny", audit: GOLD.train_001.audit };
+  const r = await exp(fx, { task: "train_001", base: BASE.train_001, variant: both, tests: ["A.release_payment", "P.policy_first"], predict: "better" });
+  assert.equal(r.outcome, "confirmed");
+  assert.equal(el(fx, "A.release_payment").status, "active");
+  assert.equal(el(fx, "P.policy_first").status, "active");
+  const r2 = await exp(fx, { task: "train_001", base: both, variant: BASE.train_001, tests: ["A.release_payment", "P.policy_first"], predict: "better" });
+  assert.equal(r2.outcome, "refuted");
+  assert.equal(r2.published, false);
+  assert.equal(el(fx, "P.policy_first").status, "active");
+});
+
+test("changing a confirmed rule sends it back to hypothesis; rewording its description does not", async () => {
   const { fx, corpus } = seeded();
-  const add = applyEdits(
-    fx.slot,
-    [
-      {
-        op: "ADD",
-        element: { id: "P.policy_text_wins", kind: "precedence", prefer: "policy text", over: "a stale worksheet" },
-        evidence: [q2Policy],
-      },
-    ],
-    corpus,
-    { date: DATE },
-  );
-  assert.equal(add.published, true, JSON.stringify(add.rejected));
-  const r = applyEdits(
-    fx.slot,
-    [
-      { op: "SUPPORT", id: "A.approve_payment", session: "s2", use: { score: 50 } },
-      { op: "SUPPORT", id: "E.Claim", session: "s2", use: { score: 100 } },
-      { op: "SUPPORT", id: "P.policy_text_wins", session: "s2", use: { score: 80, prev_score: 60 } },
-    ],
-    corpus,
-    { date: DATE },
-  );
-  assert.match(r.rejected[0].reason, /is not support/);
-  assert.match(r.rejected[1].reason, /not in the ontology-used\.txt/);
-  assert.equal(r.applied.length, 1);
-  const p = loadSlot(fx.slot).onto.elements.find((e) => e.id === "P.policy_text_wins");
-  assert.equal(p.status, "active");
-  assert.equal(p.support, 1);
+  await exp(fx, { task: "train_001", base: BASE.train_001, variant: { ...BASE.train_001, decision: "deny" }, tests: ["A.release_payment"], predict: "better" });
+  const r1 = applyEdits(fx.slot, [{ op: "REFINE", id: "A.release_payment", set: { description: "Check the bills before deciding." } }], corpus, { date: DATE });
+  assert.equal(r1.published, true, JSON.stringify(r1.rejected));
+  assert.equal(el(fx, "A.release_payment").status, "active");
+  const r2 = applyEdits(fx.slot, [{ op: "REFINE", id: "A.release_payment", set: { preconditions: ["claim.status == approved"] } }], corpus, { date: DATE });
+  assert.match(r2.applied[0].summary, /back to hypothesis/);
+  assert.equal(el(fx, "A.release_payment").status, "candidate");
+  assert.equal(el(fx, "A.release_payment").support, 0);
+  // Structure still needs a quote to change.
+  const r3 = applyEdits(fx.slot, [{ op: "REFINE", id: "E.Claim", set: { key: "id" } }], corpus, { date: DATE });
+  assert.match(r3.rejected[0].reason, /needs at least one quote/);
 });
 
-test("retire refuses a referenced element; merge rewrites references", () => {
+test("retire refuses a referenced element; merge is for structure and rewrites references", () => {
   const { fx, corpus } = seeded();
   const r1 = applyEdits(fx.slot, [{ op: "RETIRE", id: "E.Claim", reason: "wrong" }], corpus, { date: DATE });
-  assert.equal(r1.published, false);
-  assert.match(r1.rejected[0].reason, /referenced by A\.approve_payment/);
-
+  assert.match(r1.rejected[0].reason, /referenced by A\.release_payment/);
   const r2 = applyEdits(
     fx.slot,
     [
       { op: "ADD", element: { ...BILL, id: "E.Invoice", name: "Invoice" }, evidence: [q1Bill] },
-      { op: "REFINE", id: "A.approve_payment", set: { requires_evidence: ["E.Invoice"], preconditions: ["no linked E.Invoice has state void"] }, evidence: [q1Bill] },
+      { op: "REFINE", id: "A.release_payment", set: { requires_evidence: ["E.Invoice"], preconditions: ["no linked E.Invoice has state void"] } },
       { op: "MERGE", id: "E.Bill", from: ["E.Invoice"] },
+      { op: "MERGE", id: "A.release_payment", from: ["P.policy_first"] },
     ],
     corpus,
     { date: DATE },
   );
-  assert.equal(r2.published, true, JSON.stringify(r2.rejected));
-  const { onto } = loadSlot(fx.slot);
-  const pay = onto.elements.find((e) => e.id === "A.approve_payment");
-  assert.deepEqual(pay.requires_evidence, ["E.Bill"]);
-  assert.deepEqual(pay.preconditions, ["no linked E.Bill has state void"]);
-  const inv = onto.elements.find((e) => e.id === "E.Invoice");
-  assert.equal(inv.status, "retired");
-  assert.equal(inv.merged_into, "E.Bill");
-  // Retired ids are never reused.
+  assert.equal(r2.published, true);
+  assert.match(r2.rejected[0].reason, /MERGE is for structure/);
+  assert.deepEqual(el(fx, "A.release_payment").requires_evidence, ["E.Bill"]);
+  assert.deepEqual(el(fx, "A.release_payment").preconditions, ["no linked E.Bill has state void"]);
+  assert.equal(el(fx, "E.Invoice").merged_into, "E.Bill");
   const r3 = applyEdits(fx.slot, [{ op: "ADD", element: { ...BILL, id: "E.Invoice" }, evidence: [q1Bill] }], corpus, { date: DATE });
   assert.match(r3.rejected[0].reason, /never reused/);
 });
 
-test("over budget: the weakest candidates go first; only actives left means nothing publishes", () => {
+test("over budget: nothing is published, by edit or by experiment", async () => {
   const { fx, corpus } = seeded();
-  const ontoFile = path.join(fx.slot, "ontology.json");
-  const onto = JSON.parse(fs.readFileSync(ontoFile, "utf8"));
-  const withoutPay = render({ ...onto, elements: onto.elements.filter((e) => e.id !== "A.approve_payment") });
-  // A budget that fits everything but the candidate action, once a constraint is added.
-  onto.budget_tokens = Math.ceil(withoutPay.length / 4) + 60;
-  fs.writeFileSync(ontoFile, JSON.stringify(onto, null, 2));
-  const r = applyEdits(
-    fx.slot,
-    [{ op: "ADD", element: { id: "C.one_payment", kind: "constraint", rule: "a claim is paid at most once" }, evidence: [q1Policy] }],
-    corpus,
-    { date: DATE },
-  );
-  assert.equal(r.published, true, JSON.stringify(r));
-  assert.ok(r.auto_retired.length >= 1);
-  assert.ok(r.tokens <= r.budget);
-
-  const tight = JSON.parse(fs.readFileSync(ontoFile, "utf8"));
-  tight.budget_tokens = 10;
-  fs.writeFileSync(ontoFile, JSON.stringify(tight, null, 2));
-  const before = fs.readFileSync(ontoFile, "utf8");
-  const r2 = applyEdits(fx.slot, [{ op: "SUPPORT", id: "E.Claim", session: "s2", quote: '"status": "pending"' }], corpus, { date: DATE });
-  assert.equal(r2.published, false);
-  assert.match(r2.reason, /over the budget/);
-  assert.equal(fs.readFileSync(ontoFile, "utf8"), before, "nothing is written");
+  const file = path.join(fx.slot, "ontology.json");
+  const onto = JSON.parse(fs.readFileSync(file, "utf8"));
+  onto.budget_tokens = Math.ceil(view(fx).length / 4) + 5;
+  fs.writeFileSync(file, JSON.stringify(onto, null, 2));
+  const before = fs.readFileSync(file, "utf8");
+  const r = applyEdits(fx.slot, [{ op: "ADD", element: { ...BILL, id: "E.Payment", name: "Payment" }, evidence: [q1Bill] }], corpus, { date: DATE });
+  assert.equal(r.published, false);
+  assert.match(r.reason, /over the budget/);
+  const x = await exp(fx, { task: "train_001", base: BASE.train_001, variant: { ...BASE.train_001, decision: "deny" }, tests: ["A.release_payment"], predict: "better" });
+  assert.equal(x.outcome, "confirmed");
+  assert.equal(x.published, false);
+  assert.match(x.reason, /recorded/);
+  assert.equal(fs.readFileSync(file, "utf8"), before);
 });
 
-test("validate passes a published slot and catches hand edits", () => {
+test("validate catches hand edits", async () => {
   const { fx, corpus } = seeded();
-  const ok = validateSlot(fx.slot, corpus);
-  assert.equal(ok.ok, true, ok.errors.join("; "));
-
-  const md = path.join(fx.slot, "ONTOLOGY.md");
-  fs.appendFileSync(md, "\nAlways approve.\n");
+  assert.equal(validateSlot(fx.slot, corpus, fx.work).ok, true);
+  fs.appendFileSync(path.join(fx.slot, "ONTOLOGY.md"), "\nAlways approve.\n");
   const skill = path.join(fx.slot, "SKILL.md");
   fs.writeFileSync(skill, fs.readFileSync(skill, "utf8").replace("Keep this folder unchanged", "Feel free to edit"));
-  const ontoFile = path.join(fx.slot, "ontology.json");
-  const onto = JSON.parse(fs.readFileSync(ontoFile, "utf8"));
-  onto.elements.find((e) => e.id === "A.approve_payment").status = "active";
+  const file = path.join(fx.slot, "ontology.json");
+  const onto = JSON.parse(fs.readFileSync(file, "utf8"));
+  onto.elements.find((e) => e.id === "A.release_payment").status = "active";
+  const p = onto.elements.find((e) => e.id === "P.policy_first");
+  p.status = "active";
+  p.support = 1;
+  p.evidence.push({ type: "experiment", id: "exp:9", task: "train_001" });
   onto.elements.find((e) => e.id === "E.Bill").evidence[0].quote = "invented evidence text";
-  fs.writeFileSync(ontoFile, JSON.stringify(onto));
-  const bad = validateSlot(fx.slot, corpus);
-  assert.equal(bad.ok, false);
-  const all = bad.errors.join("\n");
+  fs.writeFileSync(file, JSON.stringify(onto));
+  const all = validateSlot(fx.slot, corpus, fx.work).errors.join("\n");
   assert.match(all, /ONTOLOGY\.md differs/);
   assert.match(all, /SKILL\.md body differs/);
-  assert.match(all, /active policy without two tasks/);
+  assert.match(all, /A\.release_payment: active policy without a confirming experiment/);
+  assert.match(all, /P\.policy_first: exp:9 is not in experiments\.jsonl/);
   assert.match(all, /E\.Bill: quote not found verbatim/);
 });
 
-test("export strips provenance; diff reports changes", () => {
-  const { fx, corpus } = seeded();
+test("diff and skill versions", async () => {
+  const { fx } = seeded();
   const before = JSON.parse(fs.readFileSync(path.join(fx.slot, "ontology.json"), "utf8"));
-  applyEdits(fx.slot, [{ op: "SUPPORT", id: "A.approve_payment", session: "s2", quote: q2Policy.quote }], corpus, { date: DATE });
-  const dest = path.join(fx.root, "submission", "skill");
-  const r = exportSlot(fx.slot, dest);
-  assert.equal(r.elements, 3);
-  const lean = JSON.parse(fs.readFileSync(path.join(dest, "ontology.json"), "utf8"));
-  assert.ok(lean.elements.every((e) => e.evidence === undefined && e.counterexamples === undefined));
-  assert.ok(!fs.readFileSync(path.join(dest, "ontology.json"), "utf8").includes("CLM-1001"));
-  assert.deepEqual(fs.readdirSync(dest).sort(), ["ONTOLOGY.md", "SKILL.md", "ontology.json"]);
+  await exp(fx, { task: "train_001", base: BASE.train_001, variant: { ...BASE.train_001, decision: "deny" }, tests: ["A.release_payment"], predict: "better" });
   const after = JSON.parse(fs.readFileSync(path.join(fx.slot, "ontology.json"), "utf8"));
-  assert.deepEqual(diffOntologies(before, after).promoted, ["A.approve_payment"]);
-});
-
-test("skill versions", () => {
+  assert.deepEqual(diffOntologies(before, after).promoted, ["A.release_payment"]);
   assert.equal(nextSkillVersion("2026.11.12.3", "2026-11-12"), "2026.11.12.4");
   assert.equal(nextSkillVersion("2026.11.11.3", "2026-11-12"), "2026.11.12.1");
-  assert.equal(nextSkillVersion(undefined, "2026-11-12"), "2026.11.12.1");
 });
 
-test("CLI: extract, apply, validate exit codes", () => {
+test("CLI end to end against an HTTP judge", async () => {
   const fx = fixture();
-  const run = (...args) => spawnSync(process.execPath, [SCRIPT, ...args], { encoding: "utf8" });
-  assert.equal(run("init", fx.slot, "--date", DATE).status, 0);
-  const x = run("extract", "--session", "s1", "--agent-dir", fx.agentDir, "--task", "train_001", "--out", fx.corpusDir, "--log", path.join(fx.root, "s1.log"));
-  assert.equal(x.status, 0, x.stderr);
-  assert.equal(JSON.parse(x.stdout).sources, 5);
-  const judge = path.join(fx.root, "judge.json");
-  fs.writeFileSync(judge, JSON.stringify({ score: 0.6, feedback: "The decision ignored a void linked bill." }));
-  assert.equal(run("extract-judge", "--response", judge, "--task", "train_001", "--attempt", "1", "--out", fx.corpusDir).status, 0);
-  const edits = path.join(fx.root, "edits.json");
-  fs.writeFileSync(
-    edits,
-    JSON.stringify({
-      operations: [
-        { op: "ADD", element: CLAIM, evidence: [q1Claim] },
-        { op: "ADD", element: BILL, evidence: [q1Bill] },
-        { op: "ADD", element: PAY, evidence: [{ session: "judge:train_001:1", quote: "ignored a void linked bill" }] },
-      ],
-    }),
-  );
-  const a = run("apply", fx.slot, edits, "--corpus", fx.corpusDir, "--snapshots", path.join(fx.root, "snaps"), "--date", DATE);
-  assert.equal(a.status, 0, a.stderr);
-  assert.equal(JSON.parse(a.stdout).published, true, a.stdout);
-  assert.ok(fs.existsSync(path.join(fx.root, "snaps", "v1.json")));
-  assert.equal(run("validate", fx.slot, "--corpus", fx.corpusDir).status, 0);
-  fs.appendFileSync(path.join(fx.slot, "ONTOLOGY.md"), "tampered\n");
-  assert.equal(run("validate", fx.slot, "--corpus", fx.corpusDir).status, 1);
-  assert.equal(run("bogus").status, 2);
+  const server = http.createServer((req, res) => {
+    let body = "";
+    req.on("data", (c) => (body += c));
+    req.on("end", async () => {
+      const { task_id, answer } = JSON.parse(body);
+      res.setHeader("Content-Type", "application/json");
+      res.end(JSON.stringify(await ask(null, task_id, answer)));
+    });
+  });
+  await new Promise((r) => server.listen(0, "127.0.0.1", r));
+  try {
+    const cfg = path.join(fx.root, "training-request.json");
+    fs.writeFileSync(cfg, JSON.stringify({ judge: { url: `http://127.0.0.1:${server.address().port}/api/judge`, budget_per_task: 30 } }));
+    const cli = async (...args) => {
+      try {
+        const { stdout } = await run(process.execPath, [SCRIPT, ...args]);
+        return { code: 0, out: JSON.parse(stdout) };
+      } catch (e) {
+        return { code: e.code, err: e.stderr };
+      }
+    };
+    const file = (name, v) => {
+      const f = path.join(fx.root, name);
+      fs.writeFileSync(f, JSON.stringify(v));
+      return f;
+    };
+    assert.equal((await cli("init", fx.slot, "--date", DATE)).code, 0);
+    for (const [s, t] of [["s1", "train_001"], ["s2", "train_002"]]) {
+      const x = await cli("extract", "--session", s, "--agent-dir", fx.agentDir, "--task", t, "--out", fx.corpusDir, "--log", path.join(fx.root, `${s}.log`));
+      assert.equal(x.code, 0, x.err);
+    }
+    const base = file("base.json", BASE.train_001);
+    const common = ["--config", cfg, "--work", fx.work];
+    const jr = await cli("judge", "--task", "train_001", "--answer", base, "--phase", "baseline", "--session", "s1", ...common);
+    assert.equal(jr.out.score, 33.3333);
+    const lr = await cli("localize", "--task", "train_001", "--answer", base, ...common);
+    assert.deepEqual(lr.out.no_credit, ["decision", "audit.rule", "audit.order"]);
+    assert.equal((await cli("gaps", "--work", fx.work)).out.gaps.length, 3);
+    const edits = file("edits.json", { operations: [
+      { op: "ADD", element: CLAIM, evidence: [q1Claim] },
+      { op: "ADD", element: BILL, evidence: [q1Bill] },
+      { op: "ADD", element: PAY, evidence: [q1Policy] },
+    ] });
+    const ar = await cli("apply", fx.slot, edits, "--corpus", fx.corpusDir, "--work", fx.work, "--date", DATE);
+    assert.equal(ar.out.published, true, JSON.stringify(ar.out));
+    const variant = file("variant.json", { ...BASE.train_001, decision: "deny" });
+    const er = await cli("experiment", fx.slot, "--task", "train_001", "--base", base, "--variant", variant, "--tests", "A.release_payment", "--predict", "better", "--snapshots", path.join(fx.work, "snapshots"), "--date", DATE, ...common);
+    assert.equal(er.out.outcome, "confirmed", er.err);
+    assert.ok(fs.existsSync(path.join(fx.work, "snapshots", "v2.json")));
+    await cli("judge", "--task", "train_001", "--answer", variant, "--phase", "verify", ...common);
+    assert.equal((await cli("validate", fx.slot, "--corpus", fx.corpusDir, "--work", fx.work)).code, 0);
+    const sr = await cli("summary", fx.slot, "--work", fx.work);
+    assert.deepEqual(sr.out.phase_means, { baseline: 33.33, verify: 66.67 });
+    assert.equal(sr.out.experiments.confirmed, 1);
+    assert.equal(sr.out.judge_calls.train_001, 6);
+    const kinds = fs.readFileSync(path.join(fx.work, "records.jsonl"), "utf8").trim().split("\n").map((l) => JSON.parse(l).kind);
+    assert.deepEqual(kinds, ["attempt", "localize", "apply", "experiment", "attempt"]);
+    fs.appendFileSync(path.join(fx.slot, "ONTOLOGY.md"), "tampered\n");
+    assert.equal((await cli("validate", fx.slot, "--corpus", fx.corpusDir, "--work", fx.work)).code, 1);
+    assert.equal((await cli("bogus")).code, 2);
+  } finally {
+    server.close();
+  }
 });

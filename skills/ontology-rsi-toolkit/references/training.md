@@ -1,101 +1,122 @@
 ---
 name: ontology-training
-description: Run the Ontology RSI loop as the Ontologist inside one continuing training environment - fresh Actor attempts, judge feedback, evidence-gated edits to a typed domain model, and export of the final slot.
-version: 2026.11.12.1
+description: Run the Ontology RSI loop as the Ontologist inside one continuing training environment - baseline attempts, a map of where credit is lost, hypotheses tested by experiment on the judge, a verification pass, and export of the final slot.
+version: 2026.11.12.2
 ---
 
 # Ontology training
 
-Read `training-request.json` at the Agent State root, then `benchmark-training.md` and `ontologist.md` beside this Skill. The request gives the ordered tasks, passes, budgets, the Actor's identity and runtime, and the export paths; the brief gives the public inputs, the judge call and the score scale. The outside Organizer handles deployment and testing.
+Read `training-request.json` at the Agent State root, then `benchmark-training.md` and `ontologist.md` beside this Skill. The request gives the ordered tasks, budgets, the judge settings, the Actor's identity and runtime, and the export paths. The outside Organizer handles deployment and testing.
 
-You are the Ontologist. You do not solve tasks, draft answers or hint at them. Each attempt goes to a fresh Actor session; you read what it did and what the judge said, and you change the ontology only through the script.
+You are the Ontologist. You learn a typed model of this domain and you prove each rule before an Actor ever reads it. You never solve a task for the Actor and never write a final answer. Everything that changes the ontology or touches the judge goes through the script, which keeps the records.
 
 ```text
 STATE   = this Agent State (where training-request.json sits)
-SCRIPT  = node STATE/skills/ontology-training/onto.mjs
+SCRIPT  = <node> STATE/skills/ontology-training/onto.mjs   (<node>: `node` on PATH, else the Node.js the brief names)
+CONFIG  = STATE/training-request.json                      (holds the judge settings)
 PROJECT = <app_data_dir from your Environment section>
 ACTOR   = PROJECT/agents/<actor.agent_id>
 WORK    = paths.work from the request
 SLOT    = WORK/slot          the working ontology, with provenance
-CORPUS  = WORK/corpus        what extract pulled from Traces and judge replies
-RECORDS = WORK/records.jsonl one line per attempt
+CORPUS  = WORK/corpus        what extract pulled from Traces
 ```
 
-Keep `WORK/state.json` current (pass, task index, next attempt number, last published version) so that a compacted session resumes the run instead of restarting it.
+Pass `--config CONFIG --work WORK` to every `judge`, `localize` and `experiment` call, `--work WORK` to `apply`, and `--snapshots WORK/snapshots` to `apply` and `experiment`. The script appends each step to `WORK/records.jsonl`; do not write that file yourself. Keep `WORK/state.json` current (phase, next task) so that a compacted session resumes instead of restarting.
 
 ## Set up
 
 1. Create the Actor: `penguin agent create --agent-id <actor> --project-id <project> --json`. Copy the template's files into `ACTOR/agent_state/`, keeping the runtime's `.vault.toml`.
 2. Copy the template's `skills/domain-ontology/` to `SLOT`. `SCRIPT validate SLOT` must pass. Copy `SLOT/ontology.json` to `WORK/snapshots/v0.json`.
-3. Create `WORK/attempts`, `edits`, `apply`, `logs` and `snapshots`.
+3. Create `WORK/attempts`, `WORK/variants`, `WORK/edits` and `WORK/logs`.
 
-## One attempt
+## An attempt
 
-Attempts are numbered 1, 2, … across the run. For attempt `n` on task `t`:
+An attempt is one fresh Actor session on one task. Phases 1 and 4 use it.
 
-1. **Install.** Replace the Actor's slot with the deployable copy of the current ontology: remove `ACTOR/agent_state/skills/domain-ontology`, then `SCRIPT export SLOT ACTOR/agent_state/skills/domain-ontology`. Record the installed version.
-2. **Dispatch.** Call `run_subagent` with the Actor's `agent_id`, `provider`, `model_id` and `thinking_level` set explicitly, and only this prompt, filled from the brief:
+1. **Install** the deployable copy of the current ontology: remove `ACTOR/agent_state/skills/domain-ontology`, then `SCRIPT export SLOT ACTOR/agent_state/skills/domain-ontology`.
+2. **Dispatch** with `run_subagent`, setting the Actor's `agent_id`, `provider`, `model_id` and `thinking_level` explicitly, and only this prompt, filled from the brief:
 
    ```text
+   Caller agent: <your agent id>.
    Complete training task <t>. Its instruction and inputs are <public paths
    from the brief>; access to the business environment is described in
    <access file>. Write your final answer, in the task's required format, to
-   WORK/attempts/<t>-<n>.json. Do not call any judge or scoring endpoint.
+   WORK/attempts/<t>-<phase>.json instead of the path the instruction names.
+   Do not call any judge or scoring endpoint.
    When you are done, end your reply with the line "session: <your Session ID>".
    ```
 
-   Never include earlier answers, scores, judge replies, your diagnoses or this conversation.
-3. **Judge.** Do not edit the candidate. Call the training judge once, as the brief says, with that candidate, and save the raw reply to `WORK/attempts/<t>-<n>.judge.json`. Convert the score to 0–100. A failed judge call is not a scored zero: record it and do not count the attempt in any mean.
-4. **Integrity.** Export the same version to a scratch folder and compare it with the Actor's installed copy. A difference means the Actor edited its slot: record it and do not use that attempt as support.
-5. **Extract.** If the reply has no `session:` line, take the newest root Trace under `ACTOR/traces/` created after the dispatch.
+   Never include earlier answers, scores, your diagnoses or this conversation. If `run_subagent` returns a `subagent_id` before the Actor finishes, poll it with `input_subagent` (empty prompt); never steer it, and run one attempt at a time.
+3. **Score and observe.** Do not edit the answer.
 
    ```bash
+   SCRIPT judge --task <t> --answer WORK/attempts/<t>-<phase>.json --phase <phase> --session <sid> --config CONFIG --work WORK
    SCRIPT extract --session <sid> --agent-dir ACTOR --task <t> --out CORPUS \
-     --used ACTOR/scratchpad/<sid>/ontology-used.txt --log WORK/logs/<t>-<n>.log
-   SCRIPT extract-judge --response WORK/attempts/<t>-<n>.judge.json \
-     --task <t> --attempt <n> --out CORPUS
+     --used ACTOR/scratchpad/<sid>/ontology-used.txt --log WORK/logs/<t>-<phase>.log
    ```
 
-6. **Propose.** Read `WORK/logs/<t>-<n>.log`, the judge reply, `SLOT/ONTOLOGY.md` and, where you need exact values, the corpus file. Follow `ontologist.md` and write `WORK/edits/<t>-<n>.json`. An empty list is a valid proposal.
-7. **Apply.**
+   If the reply has no `session:` line, take the newest root Trace under `ACTOR/traces/` created after the dispatch. If the log shows the Actor calling the judge, or its installed slot differs from a fresh export, record the attempt as invalid in `state.json` and do not learn from it.
 
-   ```bash
-   SCRIPT apply SLOT WORK/edits/<t>-<n>.json --corpus CORPUS \
-     --snapshots WORK/snapshots > WORK/apply/<t>-<n>.json
-   ```
+## Phase 1: baseline
 
-   For rejections with a mechanical cause (a quote copied with a typo, an ADD that must come before the edit referring to it), fix only those operations and apply them as `<t>-<n>.r1.json`, at most `edit_repairs` times. Never answer a rejection by inventing a quote, dropping the evidence, or rewording content so that the barrier stops matching an instance id.
-8. **Record.** Append to `RECORDS`: pass, task, attempt, session, installed version, score, judge status, used ids, integrity, published version, applied and rejected operations with reasons, auto-retired ids, start and end times.
+Run one attempt per task, in the request's order, with phase `baseline`. The slot is still empty, so these scores are what the agent does without the ontology, and their answers are the material for every experiment.
 
-## Order, passes and time
-
-Run pass 1 over the tasks in the request's order, then pass 2 in the same order, one attempt per task per pass, sequentially. In pass 2, credit elements from the Actor's `ontology-used.txt` against that task's pass-1 score (`SUPPORT … use: {score, prev_score}`); the script promotes a candidate only on a real improvement.
-
-Before each attempt, compare elapsed session time with `time_budget_minutes − reserve_minutes`. If what remains is less than 1.5 × the longest attempt so far, stop launching, record the stop, and export. A complete pass 1 is the minimum valid handoff. Never add attempts, reorder tasks or rerun an attempt because its score is low.
-
-## Probes
-
-You may test a hypothesis about structure against the business service with read-only queries. Run them yourself, then extract your own Session as task `probe`:
+## Phase 2: map
 
 ```bash
-SCRIPT extract --session <your Session ID> --agent-dir PROJECT/agents/<your agent id> \
-  --task probe --out CORPUS
+SCRIPT localize --task <t> --answer WORK/attempts/<t>-baseline.json --config CONFIG --work WORK   # each task
+SCRIPT gaps --work WORK
 ```
 
-Probe quotes can ground fields, keys, enums and relations. They never count as task support, and a probe never looks for a task's answer.
+`localize` removes one answer field at a time and asks the judge again. A field whose removal costs points earned credit; a field whose removal changes nothing earned none: it is wrong, or it is scored only together with others. `gaps` lists the fields without credit, the ones that recur across the most tasks first. Work in that order. A gap shared by many tasks is a fact about the domain and will meet the next task too; a gap in one task may be that task's own.
+
+Then record the structure the Actors relied on (`ontologist.md`, *Structure*) with one `apply`. Keep it lean: the records and fields the gaps touch, and the sources an Actor wasted calls finding.
+
+## Phase 3: hypothesize and test
+
+For each gap, top down, follow `ontologist.md`:
+
+1. State what you think the field must be as a policy element that `decides` it, and `apply` it. It enters as a hypothesis, invisible to the Actor.
+2. Build a variant: copy a judged answer to `WORK/variants/`, and change only the decided fields to what the rule says for that task's records.
+3. Run the experiment. The prediction is part of the command, so you commit to it before the judge answers:
+
+   ```bash
+   SCRIPT experiment SLOT --task <t> --base <judged answer> --variant <variant> \
+     --tests <element id>... --predict better|worse --config CONFIG --work WORK --snapshots WORK/snapshots
+   ```
+
+   - `confirmed`: the element becomes active and is published.
+   - `refuted`: a single tested element is retired, and the record stays. State a different rule under a new id.
+   - `inconclusive`: nothing moved. The field may be scored only together with others: test the elements that decide the whole section as one bundle, and use plain comparisons (`experiment` without `--tests`) to find which parts matter.
+4. Repeat the experiment in every other task the rule applies to, building each variant from the rule's text and that task's records, never from what scored well elsewhere. Each task that confirms it adds to its support; one that refutes it retires it.
+
+Stop a gap when it is closed in every task it appears in, when its judge budget is spent, or when three different rules have been refuted and you have no better idea; note what is left open in `state.json`. Leave phase 3 when the gaps are done or two thirds of `time_budget_minutes` have passed.
+
+## Phase 4: verify
+
+An experiment shows that a rule is right. It does not show that an Actor can apply it from the rendered text. Run one attempt per task with phase `verify` on the published ontology, then `localize` each new answer.
+
+For every decided field that still has no credit, compare the Actor's answer with your confirmed variant (`experiment` without `--tests`). If the rule is right and the Actor misapplied it, the entry's wording is the defect: make it operational with `REFINE` on `description` (where the records are, in which order, what to check), which keeps it active. If the time budget allows, repeat the attempt for the tasks whose entries you reworded, still under phase `verify`; the last one counts.
+
+Never rerun an attempt because its score is low, and never hand an Actor a variant.
+
+## Time
+
+Before each attempt and each new gap, compare elapsed session time with `time_budget_minutes − reserve_minutes`. Phase 4 needs about as long as phase 1 took; start it early enough. If time runs out before phase 4, export anyway and say so.
 
 ## Export
 
-1. `SCRIPT validate SLOT --corpus CORPUS` must pass.
+1. `SCRIPT validate SLOT --corpus CORPUS --work WORK` must pass.
 2. `SCRIPT export SLOT <paths.skill_export>`.
-3. For each task, copy the candidate of its last scored attempt, unchanged, to `<paths.answers>/<task>.json`.
-4. Write `WORK/summary.json`: completed passes and the mean training score of each complete pass, the exported version, `SCRIPT stats SLOT`, applied and rejected totals, and any stop reason.
+3. For each task, copy the answer of its last valid attempt, unchanged, to `<paths.answers>/<task>.json`: the `verify` answer when there is one, else the `baseline` answer. A variant is never a final answer.
+4. `SCRIPT summary SLOT --work WORK`.
 
-`WORK` sits under the submission folder and is exported with it. End with a short report: passes completed, per-pass means, the exported version, elements per kind and status, and every failure.
+`WORK` sits under the submission folder and is exported with it. End with a short report: baseline and verify means, the rules confirmed and refuted, the gaps left open, judge calls per task, and every failure.
 
 ## What keeps the measurement honest
 
 - The Actor sees only the public task, the access brief and its frozen slot.
-- Only you change `SLOT`, and only through `SCRIPT apply`. Never edit `ontology.json`, `ONTOLOGY.md`, `SKILL.md` or the corpus by hand.
-- Judge replies are feedback for you, never for the Actor. Read nothing under `rubric/`, `solution/` or `tests/`, and no verifier output.
+- Only the script changes `SLOT` and only the script asks the judge. Never call the judge endpoint yourself, and never edit `ontology.json`, `ONTOLOGY.md`, `SKILL.md`, the corpus or the records by hand.
+- A variant is evidence about a rule, built from the rule. Searching answer values until the score rises, with no rule that produces them, teaches nothing that transfers: do not do it.
+- Read nothing under `rubric/`, `solution/` or `tests/`, and no verifier output.
 - The script blocks instance ids it can recognize. You keep out everything else that makes sense for one case only: dates, amounts, names, answer values.

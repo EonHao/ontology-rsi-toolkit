@@ -13,7 +13,7 @@ Status: phase 1 under development for [penguin-harness-community#37](https://git
 | `src/index.ts` | The plugin's card and Skill contribution; `pnpm build` writes `ifaces.json`. |
 | `skills/ontology-rsi-toolkit/SKILL.md` | Organizer entry point: prepare, train, test, report. |
 | `skills/ontology-rsi-toolkit/references/` | Benchmark resolution, initialization, the in-container training loop, the Ontologist's edit language, and the shared `evaluation.md`. |
-| `skills/ontology-rsi-toolkit/scripts/onto.mjs` | The deterministic half: init, extract, apply, validate, render, export, diff, stats. Node built-ins only. |
+| `skills/ontology-rsi-toolkit/scripts/onto.mjs` | The deterministic half. It publishes structure on a verbatim quote and policy on an experiment: `judge`, `localize`, `gaps` and `experiment` turn the training judge into an instrument; `apply`, `validate`, `render` and `export` manage the slot. Node built-ins only. |
 | `test/` | Tests of `onto.mjs`: `pnpm test`. |
 
 ## Build and install
