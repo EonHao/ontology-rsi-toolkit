@@ -1,12 +1,12 @@
 ---
 name: ontology-rsi-toolkit
 description: Organize Ontology RSI experiments on published Benchmarks - learn a typed domain model (entities, relations, lifecycles, source precedence, action contracts, constraints) whose rules are each confirmed by a controlled experiment on the training judge, freeze it, and compare it with the baseline on independent tests.
-version: 2026.11.12.2
+version: 2026.11.12.3
 ---
 
 # Ontology RSI
 
-Design: [DESIGN.md](https://github.com/EonHao/ontology-rsi-toolkit/blob/main/DESIGN.md). Training tasks and test tasks of a Benchmark share a domain, not a task. This toolkit learns that domain as a typed model kept in the Target's own State, `skills/domain-ontology/`, and it settles whether a rule is right without rerunning the agent: every policy element names the answer fields it decides, and a deterministic script ([onto.mjs](scripts/onto.mjs)) changes those fields in a saved answer, asks the training judge, and compares the two scores. The prediction is fixed before the judge is asked. A confirmed rule is published; a refuted one is retired and never reaches the Target. Structure is published on a verbatim quote of the environment's records. Model weights, tools and the harness stay fixed.
+Design: [DESIGN.md](https://github.com/EonHao/ontology-rsi-toolkit/blob/main/DESIGN.md). Training tasks and test tasks of a Benchmark share a domain, not a task. This toolkit learns that domain as a typed model kept in the Target's own State, `skills/domain-ontology/`, and it settles whether a rule is right without rerunning the agent: every policy element names the answer fields it decides, and a deterministic script ([onto.mjs](scripts/onto.mjs)) changes those fields in a saved answer, asks the training judge, and compares the two scores. The prediction is fixed before the judge is asked, and a refuted rule is retired before any Target reads it. A rule that passes is then given to a fresh Actor with nothing else: it counts as reproduced only where that Actor gains credit on the fields the rule decides, and it is retired where the Actor loses credit. Structure is published on a verbatim quote of the environment's records. Model weights, tools and the harness stay fixed.
 
 This is the outside experiment Organizer's entry point. The Organizer prepares and launches runs, collects artifacts and reports results. Inside each training environment, a continuing main Agent is the Ontologist: it sends each task to a fresh Actor session, maps where credit is lost, states hypotheses and tests them. Install [training.md](references/training.md) there as `ontology-training`. Actors and test solvers receive only the solving instruction and their frozen slot.
 
@@ -52,6 +52,7 @@ The mean shows whether the ontology helps; these show whether it helps for the s
 | Composite transfer | Gain over baseline on the composite test case (`test-005` on GDPevo-essential) ÷ mean gain on the other test cases. |
 | Harm | Test cases whose final mean is below the baseline mean. |
 | Refuted before deployment | Rules an experiment retired, so that no Actor ever read them. |
+| Replication | Per rule: reproduced, held, not reproduced or harm, with the fields that moved. |
 | Feedback cost | Judge calls per task, and experiments by outcome (confirmed, refuted, inconclusive, compared). |
 | Uptake | `verify` mean against `baseline` mean; decided fields the Actor still got wrong. |
 | Use | Per element, how many test Sessions listed it in `ontology-used.txt`; elements never used. |

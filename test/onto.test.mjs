@@ -16,6 +16,7 @@ import {
   diffOntologies,
   exportSlot,
   extractTrace,
+  finish,
   gaps,
   initSlot,
   judgeAnswer,
@@ -25,6 +26,7 @@ import {
   loadSlot,
   localize,
   nextSkillVersion,
+  replicate,
   runExperiment,
   summarize,
   traceFiles,
@@ -343,8 +345,8 @@ test("an experiment that moves as predicted makes a hypothesis active", async ()
   assert.equal(r.delta, 33.3334);
   assert.equal(r.published, true);
   assert.equal(el(fx, "A.release_payment").status, "active");
-  assert.equal(el(fx, "A.release_payment").support, 1);
-  assert.match(view(fx), /### A\.release_payment · confirmed in 1 task\nDecides: decision/);
+  assert.equal(el(fx, "A.release_payment").support, 0, "an experiment shows the value, not the rule");
+  assert.match(view(fx), /### A\.release_payment · tested in 1 task, not yet reproduced\nDecides: decision/);
   // The other direction: the base follows the rule, the variant breaks it.
   const r2 = await exp(fx, {
     task: "train_002",
@@ -354,8 +356,7 @@ test("an experiment that moves as predicted makes a hypothesis active", async ()
     predict: "worse",
   });
   assert.equal(r2.outcome, "confirmed");
-  assert.equal(el(fx, "A.release_payment").support, 2);
-  assert.match(view(fx), /confirmed in 2 tasks/);
+  assert.match(view(fx), /tested in 2 tasks, not yet reproduced/);
   const v = validateSlot(fx.slot, corpus, fx.work);
   assert.equal(v.ok, true, v.errors.join("; "));
 });
@@ -507,6 +508,60 @@ test("validate catches hand edits", async () => {
   assert.match(all, /A\.release_payment: active policy without a confirming experiment/);
   assert.match(all, /P\.policy_first: exp:9 is not in experiments\.jsonl/);
   assert.match(all, /E\.Bill: quote not found verbatim/);
+});
+
+// Records an Actor attempt the way `onto.mjs judge --phase` does.
+async function attempt(fx, phase, task, answer) {
+  const r = await judgeAnswer(fx.work, CFG, task, answer, ask);
+  fs.appendFileSync(
+    path.join(fx.work, "records.jsonl"),
+    `${JSON.stringify({ kind: "attempt", phase, task, answer_sha: r.answer_sha, score: r.score })}\n`,
+  );
+}
+
+test("replication: a rule an Actor reproduced is marked, a harmful one is retired, a silent one is demoted", async () => {
+  const { fx, corpus } = seeded();
+  const HOLD = { id: "C.hold_reason", kind: "constraint", decides: ["hold_reason"], rule: "hold_reason names the blocking record type" };
+  assert.equal(applyEdits(fx.slot, [{ op: "ADD", element: HOLD, evidence: [q1Policy] }], corpus, { date: DATE }).published, true);
+  // All three pass their experiments.
+  await exp(fx, { task: "train_001", base: BASE.train_001, variant: { ...BASE.train_001, decision: "deny" }, tests: ["A.release_payment"], predict: "better" });
+  await exp(fx, { task: "train_001", base: BASE.train_001, variant: { ...BASE.train_001, audit: GOLD.train_001.audit }, tests: ["P.policy_first"], predict: "better" });
+  await exp(fx, { task: "train_001", base: BASE.train_001, variant: { ...BASE.train_001, hold_reason: "x" }, tests: ["C.hold_reason"], predict: "worse" });
+  for (const t of ["train_001", "train_002"]) await attempt(fx, "baseline", t, BASE[t]);
+  // The Actors that read the ontology: the decision is fixed in task 1, the audit trail is
+  // still wrong everywhere, and the hold reason, right before, is now wrong in task 2.
+  await attempt(fx, "verify", "train_001", { ...BASE.train_001, decision: "deny" });
+  await attempt(fx, "verify", "train_002", { ...BASE.train_002, hold_reason: "bill" });
+  const r = await replicate(fx.slot, fx.work, CFG, { ask, date: DATE });
+  const result = Object.fromEntries(r.elements.map((e) => [e.id, e.result]));
+  assert.deepEqual(result, { "A.release_payment": "reproduced", "P.policy_first": "not reproduced", "C.hold_reason": "harm" });
+  assert.equal(el(fx, "A.release_payment").support, 1);
+  assert.match(view(fx), /### A\.release_payment · reproduced in 1 task/);
+  assert.equal(el(fx, "P.policy_first").status, "candidate");
+  assert.equal(el(fx, "C.hold_reason").status, "retired");
+  assert.match(el(fx, "C.hold_reason").retired_reason, /lost credit on hold_reason in train_002/);
+  assert.ok(!view(fx).includes("P.policy_first") && !view(fx).includes("C.hold_reason"));
+  const v = validateSlot(fx.slot, corpus, fx.work);
+  assert.equal(v.ok, true, v.errors.join("; "));
+  // finish: export, final answers from the verify attempts, summary.
+  const out = finish(fx.slot, fx.work, fx.corpusDir, path.join(fx.root, "skill"), path.join(fx.root, "answers"));
+  assert.equal(out.ok, true);
+  assert.deepEqual(out.answers, { train_001: "verify", train_002: "verify" });
+  assert.equal(JSON.parse(fs.readFileSync(path.join(fx.root, "answers", "train_001.json"), "utf8")).decision, "deny");
+  assert.equal(out.summary.replication["A.release_payment"], "reproduced");
+  assert.deepEqual(out.summary.phase_means, { baseline: 50, verify: 50 });
+});
+
+test("replication: a rule whose fields already had credit is kept, with no gain shown", async () => {
+  const { fx } = seeded();
+  await exp(fx, { task: "train_002", base: BASE.train_002, variant: { ...BASE.train_002, decision: "pay" }, tests: ["A.release_payment"], predict: "worse" });
+  await attempt(fx, "baseline", "train_002", BASE.train_002);
+  await attempt(fx, "verify", "train_002", { ...BASE.train_002 });
+  const r = await replicate(fx.slot, fx.work, CFG, { ask, date: DATE });
+  assert.equal(r.elements[0].result, "held");
+  assert.equal(r.published, false);
+  assert.equal(el(fx, "A.release_payment").status, "active");
+  assert.match(view(fx), /tested in 1 task, not yet reproduced/);
 });
 
 test("diff and skill versions", async () => {

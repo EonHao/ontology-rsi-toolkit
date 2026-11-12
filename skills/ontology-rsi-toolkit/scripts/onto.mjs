@@ -417,17 +417,21 @@ function referrersOf(id, onto) {
     .map((e) => e.id);
 }
 
-/**
- * Structure: distinct tasks whose data was quoted. Policy: distinct tasks in which an experiment
- * confirmed it. A quote shows that a situation exists; only an experiment shows that a rule holds.
- */
-export function supportOf(el) {
-  const type = isPolicy(el.kind) ? "experiment" : "quote";
+function tasksWith(el, type) {
   const tasks = new Set();
   for (const ev of el.evidence || []) {
     if (ev.type === type && ev.task && ev.task !== PROBE_TASK) tasks.add(ev.task);
   }
   return tasks.size;
+}
+
+/**
+ * Structure: distinct tasks whose data was quoted. Policy: distinct tasks in which a fresh Actor,
+ * given only the rule, gained credit on a field the rule decides. An experiment shows that the
+ * value a rule gives earns credit; only a replication shows that the rule itself carries it.
+ */
+export function supportOf(el) {
+  return tasksWith(el, isPolicy(el.kind) ? "replication" : "quote");
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -439,7 +443,9 @@ function line(label, value) {
 
 function renderElement(el) {
   const tags = [];
-  if (isPolicy(el.kind)) tags.push(`confirmed in ${el.support} task${el.support === 1 ? "" : "s"}`);
+  const n = (k) => `${k} task${k === 1 ? "" : "s"}`;
+  if (isPolicy(el.kind))
+    tags.push(el.support > 0 ? `reproduced in ${n(el.support)}` : `tested in ${n(tasksWith(el, "experiment"))}, not yet reproduced`);
   if (el.scope && el.scope !== "global") tags.push(`scope: ${el.scope}`);
   const head = `### ${[el.id, ...tags].join(" · ")}`;
   const rows = [];
@@ -525,7 +531,7 @@ export function render(onto) {
   const out = [
     `# Domain ontology · v${onto.version}`,
     "",
-    "Generated from ontology.json; do not edit. Ids are stable: cite the ones you rely on in ontology-used.txt. Structure entries were read off the environment's own records. Policy entries name the answer fields they decide and were confirmed by experiment in the number of tasks shown.",
+    "Generated from ontology.json; do not edit. Ids are stable: cite the ones you rely on in ontology-used.txt. Structure entries were read off the environment's own records. Policy entries name the answer fields they decide. Each one passed an experiment on the training judge; `reproduced` means that an earlier agent, given only the entry, then gained credit on those fields.",
   ];
   if (active.length === 0) out.push("", "Nothing has been learned yet.");
   for (const kind of RENDER_ORDER) {
@@ -637,8 +643,8 @@ export function applyOp(onto, op, corpus, version) {
       el.updated = version;
       let note = "";
       if (isPolicy(el.kind) && before !== ruleOf(el)) {
-        const had = el.evidence.some((ev) => ev.type === "experiment");
-        el.evidence = el.evidence.filter((ev) => ev.type !== "experiment");
+        const had = el.evidence.some((ev) => ev.type !== "quote");
+        el.evidence = el.evidence.filter((ev) => ev.type === "quote");
         el.status = "candidate";
         if (had) note = " (rule changed: back to hypothesis, confirm it again)";
       }
@@ -813,7 +819,7 @@ export async function judgeAnswer(work, cfg, task, answer, ask = httpAsk) {
   const reply = await ask(cfg, task, answer);
   const raw = cfg.score_path.split(".").reduce((v, k) => (v == null ? v : v[k]), reply);
   if (typeof raw !== "number" || Number.isNaN(raw)) throw new Error(`judge reply has no numeric ${cfg.score_path}`);
-  const rec = { task, answer_sha: digest, score: round4(raw * cfg.scale), reply };
+  const rec = { task, answer_sha: digest, score: round4(raw * cfg.scale), reply, answer };
   fs.writeFileSync(file, `${JSON.stringify(rec, null, 2)}\n`);
   return { ...rec, cached: false };
 }
@@ -990,7 +996,7 @@ export async function runExperiment(slot, work, cfg, spec, opts = {}) {
     const by = referrersOf(el.id, next);
     if (by.length) {
       el.status = "candidate";
-      el.evidence = el.evidence.filter((ev) => ev.type !== "experiment");
+      el.evidence = el.evidence.filter((ev) => ev.type === "quote");
       el.support = supportOf(el);
       lines.push(`REFUTE ${el.id} (${id}, ${signed(delta)}): back to hypothesis; ${by.join(", ")} refer to it`);
     } else {
@@ -1009,6 +1015,160 @@ export async function runExperiment(slot, work, cfg, spec, opts = {}) {
     };
   publish(slot, next, lines, opts);
   return { ...result, published: true, version: next.version, changes: lines };
+}
+
+// ---------------------------------------------------------------------------------------------
+// Replication: did an Actor that read only the rule gain credit where the rule decides?
+
+function attemptsByTask(work) {
+  const out = {};
+  for (const r of readJsonl(path.join(work, "records.jsonl"))) {
+    if (r.kind !== "attempt") continue;
+    out[r.task] ??= {};
+    out[r.task][r.phase] = r; // the last attempt of a task in a phase
+  }
+  return out;
+}
+
+function attemptAnswer(work, rec) {
+  const cached = path.join(work, "judge", `${safeName(rec.task)}-${rec.answer_sha.slice(0, 16)}.json`);
+  if (fs.existsSync(cached)) {
+    const c = readJson(cached);
+    if (c.answer !== undefined) return c.answer;
+  }
+  for (const f of [rec.answer, path.join(work, "attempts", path.basename(rec.answer || ""))]) {
+    if (f && fs.existsSync(f)) return readJson(f);
+  }
+  throw new Error(`the answer of ${rec.task} (${rec.phase}) is not in the records`);
+}
+
+/**
+ * Compares, per task, the knock-out maps of two attempts: one made before the ontology (`from`)
+ * and one made by a fresh Actor reading it (`to`). For each active policy element and each
+ * answer field it decides:
+ *   gain: the field had no credit before and has it now;
+ *   harm: the field had credit before and lost it;
+ *   held: credit before and after;  none: no credit before or after.
+ * An element is judged in the tasks where its value passed an experiment, so that both gates
+ * stand on the same task. One with a gain is marked reproduced in that task. One that moved
+ * nothing in any of its tasks goes back to hypothesis: the rule did not reach the Actor. One
+ * that only held stays, with no gain shown. An element charged with a harm is retired.
+ */
+export async function replicate(slot, work, cfg, opts = {}) {
+  const from = opts.from || "baseline";
+  const to = opts.to || "verify";
+  const { onto } = loadSlot(slot);
+  const maps = {};
+  for (const [task, phases] of Object.entries(attemptsByTask(work))) {
+    if (!phases[from] || !phases[to]) continue;
+    const credit = async (rec) => {
+      const loc = await localize(work, cfg, task, attemptAnswer(work, rec), opts.ask);
+      const yes = new Set(loc.credited.map((c) => c.path));
+      return { yes, all: new Set([...yes, ...loc.no_credit, ...loc.penalized.map((c) => c.path)]) };
+    };
+    maps[task] = { a: await credit(phases[from]), b: await credit(phases[to]) };
+  }
+  if (Object.keys(maps).length === 0) throw new Error(`no task has both a ${from} and a ${to} attempt`);
+
+  const next = clone(onto);
+  next.version = onto.version + 1;
+  const lines = [];
+  const report = [];
+  const deployed = next.elements.filter((e) => e.status === "active" && isPolicy(e.kind));
+  const testedIn = (el, task) => el.evidence.some((ev) => ev.type === "experiment" && ev.task === task);
+  // A field that lost credit is charged to the rules that decide it and were tested in that
+  // task; when none was, some rule was applied outside the tasks it was tested in, and every
+  // rule that decides the field is charged.
+  const blamed = new Map(); // element id → [{task, path}]
+  for (const [task, { a, b }] of Object.entries(maps)) {
+    for (const p of a.yes) {
+      if (b.yes.has(p)) continue;
+      const deciders = deployed.filter((e) => covers(e.decides, p));
+      const tested = deciders.filter((e) => testedIn(e, task));
+      for (const e of tested.length ? tested : deciders) {
+        if (!blamed.has(e.id)) blamed.set(e.id, []);
+        blamed.get(e.id).push({ task, path: p });
+      }
+    }
+  }
+  for (const el of deployed) {
+    const row = { id: el.id, tasks: {} };
+    for (const { task, path: p } of blamed.get(el.id) || []) {
+      row.tasks[task] ??= { outcome: "harm", lost: [] };
+      row.tasks[task].lost.push(p);
+    }
+    // Gains count only where the rule's value passed its experiment: both gates in one task.
+    for (const [task, { a, b }] of Object.entries(maps)) {
+      if (row.tasks[task] || !testedIn(el, task)) continue;
+      const paths = [...new Set([...a.all, ...b.all])].filter((p) => covers(el.decides, p));
+      if (paths.length === 0) continue;
+      const gained = paths.filter((p) => !a.yes.has(p) && b.yes.has(p));
+      const held = paths.filter((p) => a.yes.has(p) && b.yes.has(p));
+      const outcome = gained.length ? "gain" : held.length ? "held" : "none";
+      row.tasks[task] = { outcome, ...(gained.length ? { gained } : {}) };
+    }
+    const outcomes = Object.entries(row.tasks);
+    const harms = outcomes.filter(([, o]) => o.outcome === "harm");
+    const gains = outcomes.filter(([, o]) => o.outcome === "gain");
+    if (harms.length) {
+      for (const [task, o] of harms) el.counterexamples.push({ type: "replication", task, lost: o.lost });
+      const what = harms.map(([task, o]) => `${o.lost.join(", ")} in ${task}`).join("; ");
+      if (referrersOf(el.id, next).length) {
+        el.status = "candidate";
+        el.evidence = el.evidence.filter((ev) => ev.type === "quote");
+        lines.push(`HARM ${el.id}: an Actor that followed it lost credit on ${what}; back to hypothesis`);
+      } else {
+        el.status = "retired";
+        el.retired_reason = `harmful in replication: lost credit on ${what}`;
+        lines.push(`HARM ${el.id}: an Actor that followed it lost credit on ${what}; retired`);
+      }
+      row.result = "harm";
+    } else if (gains.length) {
+      const known = new Set(el.evidence.filter((ev) => ev.type === "replication").map((ev) => ev.task));
+      for (const [task, o] of gains) {
+        if (!known.has(task)) el.evidence.push({ type: "replication", task, gained: o.gained });
+      }
+      lines.push(`REPRODUCE ${el.id}: an Actor gained credit on ${gains.map(([task, o]) => `${o.gained.join(", ")} in ${task}`).join("; ")}`);
+      row.result = "reproduced";
+    } else if (outcomes.length && outcomes.every(([, o]) => o.outcome === "none")) {
+      el.status = "candidate";
+      lines.push(`DEMOTE ${el.id}: no Actor gained credit on what it decides; back to hypothesis`);
+      row.result = "not reproduced";
+    } else {
+      row.result = outcomes.length ? "held" : "not applicable";
+    }
+    el.support = supportOf(el);
+    if (row.result !== "held" && row.result !== "not applicable") el.updated = next.version;
+    report.push(row);
+  }
+  appendJsonl(path.join(work, "replications.jsonl"), { from, to, version: onto.version, elements: report });
+  const result = { from, to, elements: report, published: false, version: onto.version };
+  if (lines.length === 0) return result;
+  const over = overBudget(next);
+  if (over) return { ...result, reason: over };
+  publish(slot, next, lines, opts);
+  return { ...result, published: true, version: next.version };
+}
+
+/**
+ * Closes a run from its records alone: checks the slot, writes the deployable copy, copies each
+ * task's last attempt as its final answer (the `verify` one when there is one), and writes the
+ * summary. It may be run more than once; a later run replaces an earlier export.
+ */
+export function finish(slot, work, corpusDir, skillDest, answersDest) {
+  const check = validateSlot(slot, loadCorpus(corpusDir), work);
+  if (!check.ok) return { ok: false, errors: check.errors };
+  const exported = exportSlot(slot, skillDest);
+  fs.mkdirSync(answersDest, { recursive: true });
+  const answers = {};
+  for (const [task, phases] of Object.entries(attemptsByTask(work))) {
+    const rec = phases.verify || phases.baseline || Object.values(phases).at(-1);
+    fs.writeFileSync(path.join(answersDest, `${task}.json`), `${JSON.stringify(attemptAnswer(work, rec), null, 2)}\n`);
+    answers[task] = rec.phase;
+  }
+  const summary = summarize(slot, work);
+  fs.writeFileSync(path.join(work, "summary.json"), `${JSON.stringify(summary, null, 2)}\n`);
+  return { ok: true, exported, answers, summary };
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1051,6 +1211,13 @@ export function validateSlot(slot, corpus, work) {
       if (el.status === "active" && exps.length === 0)
         errors.push(`${where}: active policy without a confirming experiment`);
     } else if (el.status !== "active") errors.push(`${where}: structure is active or retired`);
+    if (work) {
+      const reps = readJsonl(path.join(work, "replications.jsonl"));
+      for (const ev of (el.evidence || []).filter((x) => x.type === "replication")) {
+        const found = reps.some((r) => r.elements.some((e) => e.id === el.id && e.tasks[ev.task]?.outcome === "gain"));
+        if (!found) errors.push(`${where}: no replication record shows a gain in ${ev.task}`);
+      }
+    }
     if (experiments) {
       for (const ev of exps) {
         const x = experiments.get(ev.id);
@@ -1317,6 +1484,9 @@ export function summarize(slot, work) {
     refuted_before_deployment: onto.elements
       .filter((e) => /^refuted by /.test(e.retired_reason || ""))
       .map((e) => e.id),
+    replication: Object.fromEntries(
+      (readJsonl(path.join(work, "replications.jsonl")).at(-1)?.elements || []).map((e) => [e.id, e.result]),
+    ),
     judge_calls: judgeCalls(work),
     ontology: stats(onto),
   };
@@ -1356,7 +1526,14 @@ Experiment (each needs --config <file with the judge settings> and --work <dir>)
       Judge two answers that differ only in fields the tested elements decide. The prediction is
       fixed here, before the judge is asked. Confirmed: the elements become active. Refuted: a
       single tested element is retired. Without --tests it only compares.
-  summary <slot> --work <dir>           Phase means, experiments, judge calls, ontology counts.
+  replicate <slot> [--from baseline] [--to verify] [--snapshots <dir>]
+      Compare, field by field, each task's attempt made before the ontology with the one a fresh
+      Actor made reading it. A rule whose fields gained credit is marked reproduced; one whose
+      fields lost credit is retired; one that moved nothing anywhere goes back to hypothesis.
+  finish <slot> --work <dir> --corpus <dir> --skill <dest> --answers <dest>
+      Validate, export the slot, copy each task's last attempt as its final answer, write the
+      summary. Safe to run more than once.
+  summary <slot> --work <dir>           Phase means, experiments, replication, judge calls, counts.
 
 Every command prints JSON on stdout.`;
 
@@ -1516,6 +1693,26 @@ export async function main(argv, hooks = {}) {
       });
       print(r);
       return 0;
+    }
+    case "replicate": {
+      if (!pos[0]) throw new Error("replicate needs <slot>");
+      const r = await replicate(pos[0], need("work"), loadJudgeConfig(need("config")), {
+        from: str("from"),
+        to: str("to"),
+        snapshots: str("snapshots"),
+        date: str("date"),
+        ask: hooks.ask,
+      });
+      record({ kind: "replicate", from: r.from, to: r.to, version: r.version, results: Object.fromEntries(r.elements.map((e) => [e.id, e.result])) });
+      print(r);
+      return 0;
+    }
+    case "finish": {
+      if (!pos[0]) throw new Error("finish needs <slot>");
+      const r = finish(pos[0], need("work"), need("corpus"), need("skill"), need("answers"));
+      record({ kind: "finish", ok: r.ok, version: r.exported?.version });
+      print(r);
+      return r.ok ? 0 : 1;
     }
     case "validate": {
       if (!pos[0]) throw new Error("validate needs <slot>");

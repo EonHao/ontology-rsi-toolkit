@@ -1,14 +1,14 @@
 ---
 name: ontology-training
-description: Run the Ontology RSI loop as the Ontologist inside one continuing training environment - baseline attempts, a map of where credit is lost, hypotheses tested by experiment on the judge, a verification pass, and export of the final slot.
-version: 2026.11.12.2
+description: Run the Ontology RSI loop as the Ontologist inside one continuing training environment - baseline attempts, a map of where credit is lost, rules tested by experiment on the judge and then reproduced by fresh Actors, and export of the final slot.
+version: 2026.11.12.3
 ---
 
 # Ontology training
 
 Read `training-request.json` at the Agent State root, then `benchmark-training.md` and `ontologist.md` beside this Skill. The request gives the ordered tasks, budgets, the judge settings, the Actor's identity and runtime, and the export paths. The outside Organizer handles deployment and testing.
 
-You are the Ontologist. You learn a typed model of this domain and you prove each rule before an Actor ever reads it. You never solve a task for the Actor and never write a final answer. Everything that changes the ontology or touches the judge goes through the script, which keeps the records.
+You are the Ontologist. You learn a typed model of this domain, and every rule in it passes two gates. An experiment on the judge shows that the value the rule gives earns credit; no Actor reads a rule before that. Then a fresh Actor, given only the rule, must gain that credit itself; a rule that cannot be reproduced is not knowledge the next task can use. You never solve a task for the Actor and never write a final answer. Everything that changes the ontology or touches the judge goes through the script, which keeps the records.
 
 ```text
 STATE   = this Agent State (where training-request.json sits)
@@ -21,7 +21,7 @@ SLOT    = WORK/slot          the working ontology, with provenance
 CORPUS  = WORK/corpus        what extract pulled from Traces
 ```
 
-Pass `--config CONFIG --work WORK` to every `judge`, `localize` and `experiment` call, `--work WORK` to `apply`, and `--snapshots WORK/snapshots` to `apply` and `experiment`. The script appends each step to `WORK/records.jsonl`; do not write that file yourself. Keep `WORK/state.json` current (phase, next task) so that a compacted session resumes instead of restarting.
+Pass `--config CONFIG --work WORK` to every `judge`, `localize`, `experiment` and `replicate` call, `--work WORK` to `apply`, and `--snapshots WORK/snapshots` to `apply`, `experiment` and `replicate`. The script appends each step to `WORK/records.jsonl`; do not write that file yourself. Keep `WORK/state.json` current (phase, next task) so that a compacted session resumes instead of restarting.
 
 ## Set up
 
@@ -90,13 +90,28 @@ For each gap, top down, follow `ontologist.md`:
    - `inconclusive`: nothing moved. The field may be scored only together with others: test the elements that decide the whole section as one bundle, and use plain comparisons (`experiment` without `--tests`) to find which parts matter.
 4. Repeat the experiment in every other task the rule applies to, building each variant from the rule's text and that task's records, never from what scored well elsewhere. Each task that confirms it adds to its support; one that refutes it retires it.
 
+Exploring a gap with plain comparisons is fair: it shows which values earn credit. It proves nothing about a rule you write afterwards to fit them. Phase 4 does, so write each rule as an instruction a stranger could follow, not as a description of the answer you found.
+
 Stop a gap when it is closed in every task it appears in, when its judge budget is spent, or when three different rules have been refuted and you have no better idea; note what is left open in `state.json`. Leave phase 3 when the gaps are done or two thirds of `time_budget_minutes` have passed.
 
-## Phase 4: verify
+Before phase 4, run the export once (see *Export*). If the session ends early, what you have proved so far is already delivered.
 
-An experiment shows that a rule is right. It does not show that an Actor can apply it from the rendered text. Run one attempt per task with phase `verify` on the published ontology, then `localize` each new answer.
+## Phase 4: reproduce
 
-For every decided field that still has no credit, compare the Actor's answer with your confirmed variant (`experiment` without `--tests`). If the rule is right and the Actor misapplied it, the entry's wording is the defect: make it operational with `REFINE` on `description` (where the records are, in which order, what to check), which keeps it active. If the time budget allows, repeat the attempt for the tasks whose entries you reworded, still under phase `verify`; the last one counts.
+An experiment shows that a value is right. It does not show that the rule you wrote produces it. Run one attempt per task with phase `verify` on the published ontology: these Actors have the rules and nothing else. Then:
+
+```bash
+SCRIPT replicate SLOT --config CONFIG --work WORK --snapshots WORK/snapshots
+```
+
+It compares each task's `baseline` and `verify` answers field by field, and judges every rule in the tasks where its experiment passed:
+
+- `reproduced`: the Actor gained credit on a field the rule decides. The rule stays, marked as reproduced.
+- `held`: the fields had credit before and after. The rule stays, with no gain shown.
+- `not reproduced`: the fields had no credit before or after. The rule goes back to hypothesis and leaves the view. The value is right, so the wording failed: rewrite the rule so that a stranger could follow it (which records, selected how, in which order), confirm it again by experiment, and repeat the attempt for that task if time allows.
+- `harm`: a field that had credit lost it. The rule is retired.
+
+Run `replicate` again after any repeated attempt; the last `verify` attempt of a task counts.
 
 Never rerun an attempt because its score is low, and never hand an Actor a variant.
 
@@ -106,12 +121,13 @@ Before each attempt and each new gap, compare elapsed session time with `time_bu
 
 ## Export
 
-1. `SCRIPT validate SLOT --corpus CORPUS --work WORK` must pass.
-2. `SCRIPT export SLOT <paths.skill_export>`.
-3. For each task, copy the answer of its last valid attempt, unchanged, to `<paths.answers>/<task>.json`: the `verify` answer when there is one, else the `baseline` answer. A variant is never a final answer.
-4. `SCRIPT summary SLOT --work WORK`.
+```bash
+SCRIPT finish SLOT --work WORK --corpus CORPUS --skill <paths.skill_export> --answers <paths.answers>
+```
 
-`WORK` sits under the submission folder and is exported with it. End with a short report: baseline and verify means, the rules confirmed and refuted, the gaps left open, judge calls per task, and every failure.
+One command validates the slot, writes the deployable copy, copies each task's last attempt, unchanged, as its final answer (the `verify` one when there is one, else the `baseline` one; a variant is never a final answer) and writes `WORK/summary.json`. It must print `"ok": true`. Run it at the end of phase 3 and again as your last step; a later run replaces an earlier export.
+
+`WORK` sits under the submission folder and is exported with it. End with a short report: baseline and verify means, the rules reproduced, held, not reproduced and refuted, the gaps left open, judge calls per task, and every failure.
 
 ## What keeps the measurement honest
 
