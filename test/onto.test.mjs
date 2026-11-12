@@ -548,12 +548,13 @@ test("validate catches hand edits", async () => {
   assert.match(all, /E\.Bill: quote not found verbatim/);
 });
 
-// Records an Actor attempt the way `onto.mjs judge --phase` does.
+// Records an Actor attempt the way `onto.mjs judge --phase` does, with the slot version it ran under.
 async function attempt(fx, phase, task, answer) {
   const r = await judgeAnswer(fx.work, CFG, task, answer, ask);
+  const slot_version = loadSlot(fx.slot).onto.version;
   fs.appendFileSync(
     path.join(fx.work, "records.jsonl"),
-    `${JSON.stringify({ kind: "attempt", phase, task, answer_sha: r.answer_sha, score: r.score })}\n`,
+    `${JSON.stringify({ kind: "attempt", phase, task, answer_sha: r.answer_sha, score: r.score, slot_version })}\n`,
   );
 }
 
@@ -617,6 +618,32 @@ test("replication: a rule never paired with a verify attempt leaves the view; me
   assert.ok(!view(fx).includes("P.policy_first"));
   // Only decided fields are knocked out: decision and the two audit fields, in two answers.
   assert.ok(asked - before <= 6, `replication asked the judge ${asked - before} times`);
+});
+
+test("replication: every verify attempt counts; one that loses credit is a harm, unless the rule changed since", async () => {
+  const { fx, corpus } = seeded();
+  await exp(fx, { task: "train_002", base: BASE.train_002, variant: { ...BASE.train_002, decision: "pay" }, tests: ["A.release_payment"], predict: "worse" });
+  await attempt(fx, "baseline", "train_002", BASE.train_002);
+  // Two verify attempts under the same rule: the first breaks the decision, the second does not.
+  await attempt(fx, "verify", "train_002", { ...BASE.train_002, decision: "pay" });
+  await attempt(fx, "verify", "train_002", { ...BASE.train_002 });
+  const r = await replicate(fx.slot, fx.work, CFG, { ask, date: DATE });
+  assert.equal(r.elements.find((e) => e.id === "A.release_payment").result, "harm", "a retry does not erase a loss");
+  assert.equal(el(fx, "A.release_payment").status, "retired");
+  assert.deepEqual(summarize(fx.slot, fx.work).phase_scores.verify, { train_002: 50 });
+  assert.equal(summarize(fx.slot, fx.work).attempts.verify, 2);
+
+  // The same history, but the rule is rewritten after the bad attempt: only later attempts count.
+  const g = seeded();
+  await runExperiment(g.fx.slot, g.fx.work, CFG, { task: "train_002", base: BASE.train_002, variant: { ...BASE.train_002, decision: "pay" }, tests: ["A.release_payment"], predict: "worse" }, { ask, date: DATE });
+  await attempt(g.fx, "baseline", "train_002", BASE.train_002);
+  await attempt(g.fx, "verify", "train_002", { ...BASE.train_002, decision: "pay" });
+  applyEdits(g.fx.slot, [{ op: "REFINE", id: "A.release_payment", set: { preconditions: ["claim.status == approved", "no linked E.Bill is void or pending"] } }], g.corpus, { date: DATE });
+  await runExperiment(g.fx.slot, g.fx.work, CFG, { task: "train_002", base: BASE.train_002, variant: { ...BASE.train_002, decision: "pay" }, tests: ["A.release_payment"], predict: "worse" }, { ask, date: DATE });
+  await attempt(g.fx, "verify", "train_002", { ...BASE.train_002 });
+  const r2 = await replicate(g.fx.slot, g.fx.work, CFG, { ask, date: DATE });
+  assert.equal(r2.elements.find((e) => e.id === "A.release_payment").result, "held");
+  assert.equal(loadSlot(g.fx.slot).onto.elements.find((e) => e.id === "A.release_payment").status, "active");
 });
 
 test("export owns its folder: files written beside it are removed", () => {
@@ -693,7 +720,9 @@ test("CLI end to end against an HTTP judge", async () => {
     const er = await cli("experiment", fx.slot, "--task", "train_001", "--base", base, "--variant", variant, "--tests", "A.release_payment", "--predict", "better", "--snapshots", path.join(fx.work, "snapshots"), "--date", DATE, ...common);
     assert.equal(er.out.outcome, "confirmed", er.err);
     assert.ok(fs.existsSync(path.join(fx.work, "snapshots", "v2.json")));
-    await cli("judge", "--task", "train_001", "--answer", variant, "--phase", "verify", ...common);
+    const noSlot = await cli("judge", "--task", "train_001", "--answer", variant, "--phase", "verify", ...common);
+    assert.match(noSlot.err, /a verify attempt needs --slot/);
+    await cli("judge", "--task", "train_001", "--answer", variant, "--phase", "verify", "--slot", fx.slot, ...common);
     assert.equal((await cli("validate", fx.slot, "--corpus", fx.corpusDir, "--work", fx.work)).code, 0);
     const sr = await cli("summary", fx.slot, "--work", fx.work);
     assert.deepEqual(sr.out.phase_means, { baseline: 33.33, verify: 66.67 });
@@ -701,6 +730,8 @@ test("CLI end to end against an HTTP judge", async () => {
     assert.equal(sr.out.judge_calls.train_001, 6);
     const kinds = fs.readFileSync(path.join(fx.work, "records.jsonl"), "utf8").trim().split("\n").map((l) => JSON.parse(l).kind);
     assert.deepEqual(kinds, ["attempt", "localize", "apply", "experiment", "attempt"]);
+    const last = JSON.parse(fs.readFileSync(path.join(fx.work, "records.jsonl"), "utf8").trim().split("\n").at(-1));
+    assert.equal(last.slot_version, 2, "a verify attempt names the slot version it was made under");
     fs.appendFileSync(path.join(fx.slot, "ONTOLOGY.md"), "tampered\n");
     assert.equal((await cli("validate", fx.slot, "--corpus", fx.corpusDir, "--work", fx.work)).code, 1);
     assert.equal((await cli("bogus")).code, 2);

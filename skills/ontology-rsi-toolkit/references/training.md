@@ -1,7 +1,7 @@
 ---
 name: ontology-training
 description: Run the Ontology RSI loop as the Ontologist inside one continuing training environment - baseline attempts, a map of where credit is lost, rules tested by experiment on the judge and then reproduced by fresh Actors, and export of the final slot.
-version: 2026.11.12.4
+version: 2026.11.12.5
 ---
 
 # Ontology training
@@ -21,7 +21,7 @@ SLOT    = WORK/slot          the working ontology, with provenance
 CORPUS  = WORK/corpus        what extract pulled from Traces
 ```
 
-Pass `--config CONFIG --work WORK` to every `judge`, `localize`, `experiment`, `replicate` and `apply` call, and `--snapshots WORK/snapshots` to `apply`, `experiment` and `replicate`. Always the absolute `WORK` from the request: the script refuses any other work directory, so that one run keeps one set of records.
+Every call to the judge is recorded, plain `judge` scores included, and the report counts them. Pass `--config CONFIG --work WORK` to every `judge`, `localize`, `experiment`, `replicate` and `apply` call, and `--snapshots WORK/snapshots` to `apply`, `experiment` and `replicate`. Always the absolute `WORK` from the request: the script refuses any other work directory, so that one run keeps one set of records.
 
 ## Set up
 
@@ -50,7 +50,7 @@ An attempt is one fresh Actor session on one task. Phases 1 and 4 use it.
 3. **Score and observe.** Do not edit the answer.
 
    ```bash
-   SCRIPT judge --task <t> --answer WORK/attempts/<t>-<phase>.json --phase <phase> --session <sid> --config CONFIG --work WORK
+   SCRIPT judge --task <t> --answer WORK/attempts/<t>-<phase>.json --phase <phase> --session <sid> --slot SLOT --config CONFIG --work WORK
    SCRIPT extract --session <sid> --agent-dir ACTOR --task <t> --out CORPUS \
      --used ACTOR/scratchpad/<sid>/ontology-used.txt --log WORK/logs/<t>-<phase>.log
    ```
@@ -108,10 +108,10 @@ It compares each task's `baseline` and `verify` answers field by field, and judg
 
 - `reproduced`: the Actor gained credit on a field the rule decides. The rule stays, marked as reproduced.
 - `held`: the fields had credit before and after. The rule stays, with no gain shown.
-- `not reproduced`: the fields had no credit before or after. The rule goes back to hypothesis and leaves the view. The value is right, so the wording failed: rewrite the rule so that a stranger could follow it (which records, selected how, in which order), confirm it again by experiment, and repeat the attempt for that task if time allows.
+- `not reproduced`: the fields had no credit before or after. The rule goes back to hypothesis and leaves the view. The value is right, so the wording failed: rewrite the rule so that a stranger could follow it (which records, selected how, in which order), confirm it again by experiment, and make another `verify` attempt for that task if time allows.
 - `harm`: a field that had credit lost it. The rule is retired.
 
-Run `replicate` again after any repeated attempt; the last `verify` attempt of a task counts. `replicate` knocks out only the fields that deployed rules decide, and its calls are measurements, not search, so the judge budget does not apply to them: never skip a task's replication because of the budget.
+Run `replicate` again after any repeated attempt. Every `verify` attempt made under a rule's current text counts for that rule: a field is gained only if every one of them has it, and lost if any lacks it, so a retry never erases a loss. Attempts made before a rule was rewritten no longer count for it. Make another attempt only after rewriting a rule, never to try again under the same text. `replicate` knocks out only the fields that deployed rules decide, and its calls are measurements, not search, so the judge budget does not apply to them: never skip a task's replication because of the budget.
 
 Every attempt an Actor makes on the published ontology is a `verify` attempt, whatever its score. The script accepts no other phase label. An attempt that scores below the baseline is the evidence this phase exists to find; recording it under another name, or leaving it out, would deploy the rule that caused it.
 
@@ -127,7 +127,7 @@ Before each attempt and each new gap, compare elapsed session time with `time_bu
 SCRIPT finish SLOT --work WORK --corpus CORPUS --skill <paths.skill_export> --answers <paths.answers>
 ```
 
-One command validates the slot, writes the deployable copy, copies each task's last attempt, unchanged, as its final answer (the `verify` one when there is one, else the `baseline` one; a variant is never a final answer) and writes `WORK/summary.json`. It must print `"ok": true`. Run it at the end of phase 3 and again as your last step; a later run replaces an earlier export.
+One command validates the slot, writes the deployable copy, copies each task's last attempt, unchanged, as its final answer (its last `verify` attempt when there is one, else the `baseline` one; a variant is never a final answer) and writes `WORK/summary.json`. It must print `"ok": true`. Run it at the end of phase 3 and again as your last step; a later run replaces an earlier export.
 
 `WORK` sits under the submission folder and is exported with it. End with a short report: baseline and verify means, the rules reproduced, held, not reproduced and refuted, the gaps left open, judge calls per task, and every failure.
 

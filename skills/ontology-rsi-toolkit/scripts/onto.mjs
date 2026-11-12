@@ -58,6 +58,7 @@ const META = new Set([
   "counterexamples",
   "created",
   "updated",
+  "rule_version",
   "merged_into",
   "retired_reason",
 ]);
@@ -602,6 +603,7 @@ export function applyOp(onto, op, corpus, version) {
         counterexamples: [],
         created: version,
         updated: version,
+        ...(isPolicy(el.kind) ? { rule_version: version } : {}),
       };
       added.support = supportOf(added);
       onto.elements.push(added);
@@ -646,6 +648,7 @@ export function applyOp(onto, op, corpus, version) {
         const had = el.evidence.some((ev) => ev.type !== "quote");
         el.evidence = el.evidence.filter((ev) => ev.type === "quote");
         el.status = "candidate";
+        el.rule_version = version; // attempts made under the earlier rule no longer speak for it
         if (had) note = " (rule changed: back to hypothesis, confirm it again)";
       }
       el.support = supportOf(el);
@@ -1093,12 +1096,17 @@ export async function runExperiment(slot, work, cfg, spec, opts = {}) {
 // ---------------------------------------------------------------------------------------------
 // Replication: did an Actor that read only the rule gain credit where the rule decides?
 
+/**
+ * Per task: `baseline` is its first baseline attempt, `verify` every verify attempt in order.
+ * Every verify attempt counts: keeping only the last would let a run retry until it scores well.
+ */
 function attemptsByTask(work) {
   const out = {};
   for (const r of readJsonl(path.join(work, "records.jsonl"))) {
     if (r.kind !== "attempt") continue;
-    out[r.task] ??= {};
-    out[r.task][r.phase] = r; // the last attempt of a task in a phase
+    out[r.task] ??= { verify: [] };
+    if (r.phase === "verify") out[r.task].verify.push(r);
+    else if (r.phase === "baseline" && !out[r.task].baseline) out[r.task].baseline = r;
   }
   return out;
 }
@@ -1130,8 +1138,6 @@ function attemptAnswer(work, rec) {
  * hypothesis.
  */
 export async function replicate(slot, work, cfg, opts = {}) {
-  const from = opts.from || "baseline";
-  const to = opts.to || "verify";
   const { onto } = loadSlot(slot);
   const deployedDecides = onto.elements
     .filter((e) => e.status === "active" && isPolicy(e.kind))
@@ -1139,26 +1145,40 @@ export async function replicate(slot, work, cfg, opts = {}) {
   // Only the fields some deployed rule decides are knocked out: replication measures the rules,
   // and a list of many records would otherwise cost hundreds of calls. These calls measure;
   // they do not search, so the per-task budget does not apply to them.
+  const credit = async (task, answer, paths) => {
+    const base = (await judgeAnswer(work, cfg, task, answer, opts.ask, { measurement: true })).score;
+    const yes = new Set();
+    const own = new Set(leafPaths(answer).keys());
+    for (const p of paths) {
+      if (!own.has(p)) continue;
+      const sc = (await judgeAnswer(work, cfg, task, withoutPath(answer, p), opts.ask, { measurement: true })).score;
+      if (sc < base) yes.add(p);
+    }
+    return yes;
+  };
   const maps = {};
   for (const [task, phases] of Object.entries(attemptsByTask(work))) {
-    if (!phases[from] || !phases[to]) continue;
-    const A = attemptAnswer(work, phases[from]);
-    const B = attemptAnswer(work, phases[to]);
-    const paths = [...new Set([...leafPaths(A).keys(), ...leafPaths(B).keys()])].filter((p) => covers(deployedDecides, p));
-    const credit = async (answer) => {
-      const base = (await judgeAnswer(work, cfg, task, answer, opts.ask, { measurement: true })).score;
-      const yes = new Set();
-      const own = new Set(leafPaths(answer).keys());
-      for (const p of paths) {
-        if (!own.has(p)) continue;
-        const s = (await judgeAnswer(work, cfg, task, withoutPath(answer, p), opts.ask, { measurement: true })).score;
-        if (s < base) yes.add(p);
-      }
-      return { yes, all: new Set(paths) };
-    };
-    maps[task] = { a: await credit(A), b: await credit(B) };
+    if (!phases.baseline || phases.verify.length === 0) continue;
+    const A = attemptAnswer(work, phases.baseline);
+    const Bs = phases.verify.map((r) => ({ rec: r, answer: attemptAnswer(work, r) }));
+    const paths = [
+      ...new Set([A, ...Bs.map((b) => b.answer)].flatMap((x) => [...leafPaths(x).keys()])),
+    ].filter((p) => covers(deployedDecides, p));
+    const verify = [];
+    for (const b of Bs) verify.push({ version: b.rec.slot_version ?? null, yes: await credit(task, b.answer, paths) });
+    maps[task] = { a: { yes: await credit(task, A, paths), all: new Set(paths) }, verify };
   }
-  if (Object.keys(maps).length === 0) throw new Error(`no task has both a ${from} and a ${to} attempt`);
+  if (Object.keys(maps).length === 0) throw new Error("no task has both a baseline and a verify attempt");
+  // The verify attempts that speak for a rule: those made while its current text was installed.
+  // A field counts as gained only if every such attempt has it, and as lost if any lacks it.
+  const under = (el, task) => {
+    const vs = maps[task].verify.filter((v) => v.version === null || v.version >= (el.rule_version ?? el.created ?? 0));
+    if (vs.length === 0) return null;
+    const all = new Set([...vs[0].yes].filter((p) => vs.every((v) => v.yes.has(p))));
+    return { all };
+  };
+  const from = "baseline";
+  const to = "verify";
 
   const next = clone(onto);
   next.version = onto.version + 1;
@@ -1170,12 +1190,17 @@ export async function replicate(slot, work, cfg, opts = {}) {
   // task; when none was, some rule was applied outside the tasks it was tested in, and every
   // rule that decides the field is charged.
   const blamed = new Map(); // element id → [{task, path}]
-  for (const [task, { a, b }] of Object.entries(maps)) {
+  for (const [task, { a }] of Object.entries(maps)) {
     for (const p of a.yes) {
-      if (b.yes.has(p)) continue;
       const deciders = deployed.filter((e) => covers(e.decides, p));
-      const tested = deciders.filter((e) => testedIn(e, task));
-      for (const e of tested.length ? tested : deciders) {
+      const lostUnder = (e) => {
+        const b = under(e, task);
+        return b !== null && !b.all.has(p);
+      };
+      const losing = deciders.filter(lostUnder);
+      if (losing.length === 0) continue;
+      const tested = losing.filter((e) => testedIn(e, task));
+      for (const e of tested.length ? tested : losing) {
         if (!blamed.has(e.id)) blamed.set(e.id, []);
         blamed.get(e.id).push({ task, path: p });
       }
@@ -1188,12 +1213,14 @@ export async function replicate(slot, work, cfg, opts = {}) {
       row.tasks[task].lost.push(p);
     }
     // Gains count only where the rule's value passed its experiment: both gates in one task.
-    for (const [task, { a, b }] of Object.entries(maps)) {
+    for (const [task, { a }] of Object.entries(maps)) {
       if (row.tasks[task] || !testedIn(el, task)) continue;
-      const paths = [...new Set([...a.all, ...b.all])].filter((p) => covers(el.decides, p));
+      const b = under(el, task);
+      if (b === null) continue;
+      const paths = [...a.all].filter((p) => covers(el.decides, p));
       if (paths.length === 0) continue;
-      const gained = paths.filter((p) => !a.yes.has(p) && b.yes.has(p));
-      const held = paths.filter((p) => a.yes.has(p) && b.yes.has(p));
+      const gained = paths.filter((p) => !a.yes.has(p) && b.all.has(p));
+      const held = paths.filter((p) => a.yes.has(p) && b.all.has(p));
       const outcome = gained.length ? "gain" : held.length ? "held" : "none";
       row.tasks[task] = { outcome, ...(gained.length ? { gained } : {}) };
     }
@@ -1230,7 +1257,7 @@ export async function replicate(slot, work, cfg, opts = {}) {
       // No task where it was tested has a pair of attempts: it was never replicated, and a rule
       // that has not passed both gates does not reach the Target.
       el.status = "candidate";
-      lines.push(`UNREPLICATED ${el.id}: no ${to} attempt in a task where it was tested; back to hypothesis`);
+      lines.push(`UNREPLICATED ${el.id}: no ${to} attempt under its current text in a task where it was tested; back to hypothesis`);
       row.result = "not replicated";
     }
     el.support = supportOf(el);
@@ -1258,7 +1285,8 @@ export function finish(slot, work, corpusDir, skillDest, answersDest) {
   fs.mkdirSync(answersDest, { recursive: true });
   const answers = {};
   for (const [task, phases] of Object.entries(attemptsByTask(work))) {
-    const rec = phases.verify || phases.baseline || Object.values(phases).at(-1);
+    const rec = phases.verify.at(-1) || phases.baseline;
+    if (!rec) continue;
     fs.writeFileSync(path.join(answersDest, `${task}.json`), `${JSON.stringify(attemptAnswer(work, rec), null, 2)}\n`);
     answers[task] = rec.phase;
   }
@@ -1572,16 +1600,23 @@ export function stats(onto) {
 
 /** What the run did, computed from its records, not written by hand. */
 export function summarize(slot, work) {
-  const phases = {};
+  // Every attempt counts: a task's score in a phase is the mean of all its attempts there.
+  const all = {};
   for (const r of readJsonl(path.join(work, "records.jsonl"))) {
     if (r.kind !== "attempt") continue;
-    phases[r.phase] ??= {};
-    phases[r.phase][r.task] = r.score; // the last attempt of a task in a phase
+    all[r.phase] ??= {};
+    (all[r.phase][r.task] ??= []).push(r.score);
   }
   const mean = (o) => {
-    const v = Object.values(o);
+    const v = Array.isArray(o) ? o : Object.values(o);
     return v.length ? Math.round((v.reduce((a, b) => a + b, 0) / v.length) * 100) / 100 : null;
   };
+  const phases = Object.fromEntries(
+    Object.entries(all).map(([ph, tasks]) => [ph, Object.fromEntries(Object.entries(tasks).map(([t, v]) => [t, mean(v)]))]),
+  );
+  const attempts = Object.fromEntries(
+    Object.entries(all).map(([ph, tasks]) => [ph, Object.values(tasks).reduce((n, v) => n + v.length, 0)]),
+  );
   const exps = readJsonl(path.join(work, "experiments.jsonl"));
   const outcomes = {};
   for (const x of exps) outcomes[x.outcome] = (outcomes[x.outcome] || 0) + 1;
@@ -1589,6 +1624,7 @@ export function summarize(slot, work) {
   return {
     phase_scores: phases,
     phase_means: Object.fromEntries(Object.entries(phases).map(([k, v]) => [k, mean(v)])),
+    attempts,
     experiments: { total: exps.length, ...outcomes },
     refuted_before_deployment: onto.elements
       .filter((e) => /^refuted by /.test(e.retired_reason || ""))
@@ -1624,8 +1660,9 @@ Observation
       Use --task probe for your own read-only probes.
 
 Experiment (each needs --config <file with the judge settings> and --work <dir>)
-  judge --task <id> --answer <file> [--phase <name> --session <id>]
-      Score an answer. With --phase it is recorded as that task's attempt in that phase.
+  judge --task <id> --answer <file> [--phase baseline|verify --session <id>] [--slot <slot>]
+      Score an answer; every call is recorded. With --phase it is that task's attempt in that
+      phase; a verify attempt also needs --slot, the slot installed for the Actor.
   localize --task <id> --answer <file>
       Remove one answer field at a time and judge again: which fields earn credit, which do not.
   gaps --work <dir>
@@ -1758,6 +1795,8 @@ export async function main(argv, hooks = {}) {
       const task = need("task");
       if (str("phase") !== undefined && !PHASES.has(str("phase")))
         throw new Error(`--phase must be baseline or verify; every attempt an Actor makes is recorded under one of them`);
+      if (str("phase") === "verify" && !str("slot"))
+        throw new Error("a verify attempt needs --slot <slot>, so that it is tied to the rules it was made under");
       const r = await judgeAnswer(work, loadJudgeConfig(need("config")), task, readJson(need("answer")), hooks.ask);
       if (str("phase"))
         record({
@@ -1768,7 +1807,9 @@ export async function main(argv, hooks = {}) {
           answer: str("answer"),
           answer_sha: r.answer_sha,
           score: r.score,
+          ...(str("slot") ? { slot_version: loadSlot(str("slot")).onto.version } : {}),
         });
+      else record({ kind: "judge", task, answer: str("answer"), answer_sha: r.answer_sha, score: r.score, cached: r.cached });
       print({ task, score: r.score, cached: r.cached, answer_sha: r.answer_sha });
       return 0;
     }
