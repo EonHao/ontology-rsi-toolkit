@@ -18,7 +18,7 @@ The hard part is deciding which rules are right. Existing toolkits rerun the age
 
 Structure (entities, relations, lifecycles) is published on a verbatim quote of what the environment returned.
 
-On GDPevo-essential the six-group test mean goes from 56.32 (baseline) to 67.78 ± 0.60.
+On GDPevo-essential the six-group test mean goes from 56.32 (baseline) to 67.78 ± 0.78.
 
 ## Motivation
 
@@ -134,17 +134,17 @@ The card has category `rsi`, so the toolkit appears under **Method** in the Opti
 
 ### Results
 
-Test score: mean ± sample std over three repetitions. Train: fresh Actors on the training tasks, before → after the ontology. Rules: deployed policy elements by replication outcome.
+Test score: mean ± sample std over three repetitions; attempt j of a case is its j-th trial by start time. Train: fresh Actors on the training tasks, before → after the ontology. Rules: deployed policy elements by replication outcome.
 
 | Group | Baseline | Test | Train | Rules (reproduced / held) | Judge calls | Training cost |
 | --- | --- | --- | --- | --- | --- | --- |
 | Coverage Review | 55.00 | 58.33 ± 2.89 | 84.6 → 93.4 | 3 / 6 | 225 | $0.83 |
-| Service Ticket Resolution | 48.90 | 85.10 ± 0.35 | 88.2 → 94.1 | 4 / 5 | 255 | $0.78 |
+| Service Ticket Resolution | 48.90 | 85.10 ± 0.83 | 88.2 → 94.1 | 4 / 5 | 255 | $0.78 |
 | Financial Control | 50.96 | 63.42 ± 0.94 | 73.9 → 92.0 | 4 / 2 | 416 | $0.53 |
-| Court Clerk Operations | 52.60 | 52.21 ± 3.65 | 86.5 → 87.6 | 1 / 0 | 658 | $0.59 |
+| Court Clerk Operations | 52.60 | 52.21 ± 0.50 | 86.5 → 87.6 | 1 / 0 | 658 | $0.59 |
 | Portfolio Management | 70.16 | 75.07 ± 2.29 | 71.9 → 90.5 | 5 / 9 | 571 | $1.05 |
 | Engineering Portfolio Analytics | 60.32 | 72.55 ± 0.00 | 43.9 → 100 | 10 / 4 | 430 | $1.10 |
-| **Mean** | **56.32** | **67.78 ± 0.60** | | | | **$4.87** |
+| **Mean** | **56.32** | **67.78 ± 0.78** | | | | **$4.87** |
 
 - 24 of 30 test cases are at or above their baseline mean.
 - No deployed rule was harmful in replication. Two rules in Engineering Portfolio Analytics were refuted by experiment and never reached an Actor.

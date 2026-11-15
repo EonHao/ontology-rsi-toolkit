@@ -2,7 +2,7 @@
 
 An RSI toolkit for [PenguinHarness](https://github.com/Prism-Shadow/penguin-harness). It learns a typed model of an agent's working domain (entities, relations, lifecycles, source precedence, action contracts, constraints) from the agent's own runs. Each policy rule is tested by editing the answer fields it decides and asking the training judge, then kept only if fresh agents reading it reproduce the gain.
 
-GDPevo-essential, DeepSeek-V4.1-Flash-1017: six-group test mean 56.32 (baseline) → 67.78 ± 0.60. Details in [DESIGN.md](DESIGN.md) · [中文](DESIGN.zh.md).
+GDPevo-essential, DeepSeek-V4.1-Flash-1017: six-group test mean 56.32 (baseline) → 67.78 ± 0.78. Details in [DESIGN.md](DESIGN.md) · [中文](DESIGN.zh.md).
 
 ## Install
 
