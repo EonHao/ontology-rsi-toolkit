@@ -1,7 +1,7 @@
 {
- "hash": "9e16b8cefb40833f36ed0b5e0a87117412e373e3fd783b2a14ef095bffb7debb",
+ "hash": "291e3ebb56c44b3705e8daeba009256167626e16a132e756882ec78a5a815ac7",
  "ifaces": {
-  "@penguinharness/ontology-rsi-toolkit#OntologyRsiToolkitPlugin": {
+  "ontology-rsi-toolkit#OntologyRsiToolkitPlugin": {
    "name": "OntologyRsiToolkitPlugin",
    "methods": {},
    "slots": {}
@@ -14,7 +14,7 @@
    "kind": "component",
    "requires": {},
    "provides": {
-    "OntologyRsiToolkitPlugin": "@penguinharness/ontology-rsi-toolkit#OntologyRsiToolkitPlugin"
+    "OntologyRsiToolkitPlugin": "ontology-rsi-toolkit#OntologyRsiToolkitPlugin"
    },
    "contributes": {
     "PluginLibraryModule.cards": [

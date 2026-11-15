@@ -1,380 +1,204 @@
 # Ontology RSI Toolkit
 
-- Feature Name: `ontology-rsi-toolkit`
-- Start Date: 2026-11-11
-- Quest: RSI-Q008，[penguin-harness-community#37](https://github.com/Prism-Shadow/penguin-harness-community/issues/37)
-- Author: EonHao
-- Status: 草案，待维护者评审
+- 任务：RSI-Q008，[penguin-harness-community#37](https://github.com/Prism-Shadow/penguin-harness-community/issues/37)
+- 作者：EonHao
+- 状态：已实现，已在 GDPevo-essential 全部六组上评测
 
 [English](DESIGN.md)
 
-## Summary
-[summary]: #summary
+## 概述
 
-训练任务与测试任务之间共享的是领域，不是任务本身，所以自进化应当学习的是对这个领域的建模。本提案提出一个 RSI 工具包：为 Agent 维护一份带类型的领域本体，并根据 Agent 自己的 Trace 持续精炼。
+GDPevo 的训练题和测试题共享的是领域，不是题目。本工具包把这个领域学成一份类型化本体，存在 Target 的 Agent State 里，内容包括实体、关系、生命周期、数据源优先级、动作契约和约束。
 
-本体由六类元素组成：实体类型、关系、状态生命周期、来源优先级、动作契约和约束。每个元素都必须引用一段能在 Trace 中逐字找到的原文。元素按 `candidate → active → retired` 的生命周期演进，推进的依据是计数得到的支持数和反例。
+难点在于判断哪条规则是对的。现有工具包的做法是带着候选规则重跑 agent，比较总分。这个信号里混着规则本身的作用、每次运行的随机波动，以及上下文里其他所有规则的影响。本工具包改为逐条直接检验：
 
-本体存放在被测 Agent 的 Agent State 学习槽中，机制与 ACE、AWM 工具包相同。插件包本身不包含任何领域内容。
+1. 每条策略规则声明它决定答案里的哪些字段（`decides`）。
+2. **实验**：脚本按规则修改已保存答案里的这些字段，请训练 judge 重新打分，并与事先给定的预测比较。这一步不运行模型。被证伪的规则在任何 agent 读到之前就退役。
+3. **复现**：全新的 agent 只依靠本体重新做题。它们在规则决定的字段上保持或获得得分，规则才保留；只要有一处丢分，规则就退役。
 
-验证在 GDPevo-essential 上进行，模型为 DeepSeek-V4.1-Flash-1017，实验口径与现有榜单一致。评估除了看均分，还逐一检验预先写明的五个假设。
+结构类知识（实体、关系、生命周期）凭环境返回内容的逐字引用发布。
 
-## Motivation
-[motivation]: #motivation
+在 GDPevo-essential 上，六组测试均分从 56.32（baseline）提升到 67.78 ± 0.60。
 
-### 从训练题能迁移到测试题的是什么
+## 动机
 
-GDPevo-essential 中，每道训练题都有一道同类的测试题与之配对：`train-00k` 和 `test-00k` 只在实体、日期或司法辖区上不同；`test-005` 往往是前面几类题的组合。例如，Financial Control 的 `test-005` 要求把报销敞口和预付账款与总账的差异合在一起分析；Service Ticket Resolution 的 `test-005` 则要求按同样的状态、路由和证据规则，审核别人提交的更新。
+### 什么能迁移
 
-训练集和测试集共享的是领域：有哪些记录类型，记录之间怎样关联、怎样变更状态，以哪个来源为准，什么条件下允许做什么决策。具体实例的取值不会迁移。学习器在领域之外存下的任何东西，都帮不了测试题，反而可能拖累测试题。
+`train-00k` 和 `test-00k` 是同一类任务，记录不同。它们共享记录类型、记录之间如何关联和变更状态、哪个数据源优先，以及哪些决定是允许的。具体的实例值不能迁移。
 
-### 现有学习器在哪里丢掉了这一点
+### 为什么总分无法判断单条规则
 
-已发布的四个方法学到的都是自由文本规则或 Skill，并且以训练分数上升作为保留修改的依据，这带来两个后果。
+本工具包的第一版在重做题目分数上升时提升规则。在 Coverage Review 上，训练均分从 89.9 降到 83.0，测试均分 59.33，baseline 是 55.00。
 
-第一，一次修改里混着领域知识和实例巧合，训练分数分不开二者，因为两者都能让分数上升。
+judge 对每份答案只返回一个分数。把保存的答案每次改一个字段再重新打分（113 次 judge 调用，不运行模型），结果是：
 
-第二，训练分数会饱和。judge 每道题只返回一个分数，每组只有五道训练题。已记录的 24 次训练中，有 5 次的最终训练均分正好是 100。到了这一步，分数已经不再提供任何信息，规则集却还可以继续改。
+- 五道训练题丢分都在同样的四个字段上，即该组所有任务共有的 `basis_audit` 一节。而学习者把预算花在了描述 18 个实体上。
+- 两次退步各由一个字段造成，各对应一条错误规则（−16.7 和 −18.2）。
 
-PR #16 的数据印证了这两点。下表中的数值均为 6 组的平均：
+每条规则只需一次 judge 调用，就能在任何 agent 读到之前把这两条证伪。
 
-| 方法 | 测试均分 | 最终训练均分 | 训练 − 测试差距 | case 005 上的提升 | case 001–004 上的提升 | 低于基线的测试题 |
-| --- | --- | --- | --- | --- | --- | --- |
-| SkillAdam | 68.95 | 90.0–100 | 27.8 | +6.6 | +14.1 | 30 道中 6 道 |
-| SkillOpt | 70.25 | 95.1–100 | 27.4 | +2.0 | +16.9 | 30 道中 5 道 |
-| TRACE | 68.02 | 80.6–94.3 | 18.3 | +7.3 | +12.8 | 30 道中 8 道 |
-| OpenSkill | 62.16 | 46.8–88.1 | 14.7 | −1.0 | +7.5 | 30 道中 10 道 |
+### 为什么要类型化
 
-训练均分是在训练会话内、judge 可用的条件下测得的，所以训练与测试的差距并不能单纯看作过拟合程度。但后三列只用测试协议测量，呈现的是同一个规律：在组合题上，提升明显缩小；每个方法都会让 30 道测试题中的 5 到 10 道低于基线。Court Clerk 的 case 001，四个方法全部低于基线；Financial Control 的 case 005，SkillOpt 掉了 31.7 分。
+类型化的规则有可观测的对象：`decides: [basis_audit.controlling_record_ids]` 把规则绑定到它设定的字段，因此可以单独检验。一段自由文本做不到这一点。类型化也把领域和实例分开：脚本会拒绝点名任务、点名任务输入中的 id，或点名只在一个任务里出现过的记录 id 的内容。
 
-[GDPevo 实验报告](https://penguin.ooo/blog/gdpevo-self-evolution) 把其中一例追溯到了具体规则：在 Court Clerk Operations 上，SkillAdam 后期的修改写进了 "Delay contract cases 14d & skip Fridays"。这只是五道训练题碰巧呈现的共性，却被写成了规则。
+## 设计
 
-### 带类型的领域模型改变了什么
+### 本体
 
-1. **从结构上把领域和实例分开。** 知识只能挂在某个类型上，例如 `E.Claim`、`A.approve_payment`；修改中只要出现实例或案例的 id，就会被 Validate 拒绝。巧合要想进入本体，只能以“关于某个类型的断言”出现，并且还要通过第 2 点的检验。
-2. **让证据可以计数。** 两道题支持同一条规则，就是对同一个 id 执行两次 `SUPPORT` 操作。支持数和反例因此都是精确的计数，既不需要 embedding 模型，也不需要验证集，而 GDPevo 恰好没有验证集。
-3. **监督信号不只来自分数，也来自观察。** 每一次工具输出都是对领域的一次观察：一个 schema、一个状态、一条关联。直接观察到的结构，观察一次即可采纳；只有推断出来的策略，才需要等待分数和重复的支持。GDPevo 的业务服务是只读的，验证假设时发一条查询即可，不会影响任务本身。观察回答的是“领域是什么样的”，分数回答的是“这个决策对不对”。
-4. **可以组合。** 一道组合了两类题的任务，需要的是两类题各自涉及的实体和契约之和。在类型化模型里，这只是一次查找；而按题型分别学到的工作流，无法这样直接组合。
-5. **把策略变成检查。** 契约给 Agent 提供了一份提交前的检查清单。对模型来说，对照明确的规则检查一个决策，通常比在规则没有说出口的情况下直接做出正确决策更容易。Service Ticket Resolution 的 `test-005`（审核更新）本身就是这样一次检查。
+`ontology.json` 是唯一的数据源；`ONTOLOGY.md` 由它渲染而来供 Target 阅读，只包含 active 元素，上限 6,000 token。
 
-评估部分把以上每一点都写成假设并加以检验，见下文 *Hypotheses*。
-
-### 与路线图的关系
-
-社区路线图的 Stage 1 只进化 Harness，模型权重保持不变。它偏好可读、可审计、可回滚、能在不同模型之间迁移的产物，而带类型的本体是这类产物里结构化程度最高的一种：每个元素都可以用脚本校验。本工具包对应 Stage 1 的两条主线：Framework 方面，提供一个新工具包；Data 方面，按 RFC-0002 格式提交 6 条 GDPevo-essential 实验记录。
-
-从 catalog 中的简介来看，Awesome RSI 收录的 131 个方法里，没有一个学习“前置条件 + 效果”形式的动作模型。最接近的 EvoOntology 依赖验证集。
-
-## Guide-level explanation
-[guide-level-explanation]: #guide-level-explanation
-
-把本工具包安装在负责运行实验的 Agent 上之后，它会和其他工具包一起出现在评估中心 Optimize 页的 **Method** 下拉框中。也可以直接用提示词启动：
-
-```text
-Use the `ontology-rsi-toolkit` Skill to train agent `reviewer` on Benchmark
-`gdpevo-essential-coverage-review-train`, then measure the frozen ontology on
-`gdpevo-essential-coverage-review-test`.
-```
-
-Skill 的执行流程与其他工具包一致：
-
-1. 在被测 Agent 中初始化学习槽；
-2. 测量 H1；
-3. 在训练题上运行精炼循环；
-4. 冻结本体；
-5. 在测试集上测量。
-
-训练结束后，被测 Agent 的 State 中会多出 `skills/domain-ontology/`。被测 Agent 在第一次做实质操作之前，会先读渲染出来的 `ONTOLOGY.md`。下面是一段示例，内容是训练中学到的，并非插件自带：
-
-```markdown
-## Actions
-### A.approve_payment · active · support 3
-Params: claim: E.Claim
-Requires: claim.status == approved; no linked E.Bill is void or has a cleared E.Payment
-Evidence to fetch: E.Bill, E.Payment
-
-## Precedence
-### P.current_over_export · candidate · support 1 · verify against data first
-Current clinical records (documents.is_current = true) override the stale export.
-```
-
-第二阶段会增加日常建模用的 `skills/ontology` Skill，以及两个用于 benchmark 之外场景的 Hook，详见下文。
-
-## Reference-level explanation
-[reference-level-explanation]: #reference-level-explanation
-
-### 现有代码带来的约束
-
-| # | 事实 | 依据 | 影响 |
-| --- | --- | --- | --- |
-| 1 | 社区 RFC-0003 所述的 `package.json` 中的 `penguin` 块已不再被读取，也没有兼容逻辑。 | `penguin-harness/rfcs/PRFC-0003-plugin.md` v1.1.0（2026-11-04） | 改为在 `src/index.ts` 中用 `@Component({contributes})` 声明，构建时生成 `ifaces.json`。社区 RFC-0003 已经过时。 |
-| 2 | `penguin-harness-plugins` 是一个索引仓库，每个条目是一个 `manifest.toml`，指向一个 npm 包或一个 GitHub Release 压缩包。 | 该仓库的 `README.md`、`CONTRIBUTING.md` | 源码需要另外托管，见 *Delivery*。 |
-| 3 | GDPevo-essential 的 12 个任务组全部声明了 `state_mode: read_only`。 | `penguin-harness-benchmark` 中各组的 `task_group.yaml` | 在 GDPevo 上，契约约束的是写进答案的业务决策，而不是会修改状态的工具调用。 |
-| 4 | Harbor 测试只加载冻结的 `skill/` 目录和一行读取指令。 | benchmark 的 `README.md`；`skilladam-rsi-toolkit` 的 `initialization.md` | 本体以文件形式放在 `skill/` 中；验证流程不依赖 Hook。 |
-| 5 | 重装插件会整体替换 `skills/<name>/`；开启限制性沙箱后，Agent 不能写自己的 Agent State。 | 文档 *Skills › Installation and storage*、*Settings › Sandbox* | 学到的数据放在被测 Agent 自己拥有的学习槽中；写入失败的改动先暂存在 scratchpad。 |
-
-### 本体模型
-
-`ontology.json` 是唯一的数据源，工具包由它渲染出 `ONTOLOGY.md` 供模型阅读。选用 JSON 而不是 YAML，是因为 Hook 和 Skill 脚本只能使用 Node 内置模块，而 Node 没有内置 YAML 解析器。
-
-| 类别 | 内容 | GDPevo 中的例子 |
+| 类型 | 内容 | 发布条件 |
 | --- | --- | --- |
-| `entity` | 字段、主键、枚举值，以及实例所在的接口或数据表 | 各组业务服务中的记录类型 |
-| `relation` | 外键与基数 | Financial Control 中的 claim → bill → payment |
-| `lifecycle` | 合法的状态迁移 | claim、bill、payment 的状态 |
-| `precedence` | 两个来源冲突时以哪个为准 | Coverage Review 中的 `basis_audit.source_precedence`；Portfolio Management 中权威账簿与过期工作表之间的取舍 |
-| `action` | 参数类型、前置条件、效果、必需证据、门控顺序、失败特征 | Service Ticket Resolution 中的门控顺序与动作选择 |
-| `constraint` | 对账、阈值、生效日期等不变量，每条都带适用范围 | Court Clerk Operations 中按司法辖区划分的费用规则 |
+| `entity` | 字段、主键、枚举值、实例存放位置 | 引用 |
+| `relation` | 外键、基数 | 引用 |
+| `lifecycle` | 合法的状态转换 | 引用 |
+| `precedence` | 哪个数据源优先 | 实验，然后复现 |
+| `action` | 一个决定需要什么条件、按什么顺序 | 实验，然后复现 |
+| `constraint` | 不变量：合计、阈值、日期 | 实验，然后复现 |
 
-每个元素都带有以下字段：`id`（稳定且不复用）、`kind`、`scope`、`status`（`candidate`、`active` 或 `retired`）、`support`（支持该元素的不同任务数）、`evidence`（由 `{session, quote}` 组成的列表）和 `counterexamples`。
+策略元素带有 `decides`，即答案路径的列表；`rows.status` 覆盖 `rows` 中每条记录的 `status`。证据分三种：`quote`（指定 Session 中工具输出的原文）、`experiment`（`experiments.jsonl` 中的一条）和 `replication`（`replications.jsonl` 中的一条）。`validate` 会逐条对照记录检查。
 
-```json
-{
-  "id": "A.approve_payment",
-  "kind": "action",
-  "params": { "claim": "E.Claim" },
-  "preconditions": [
-    "claim.status == approved",
-    "no linked E.Bill is void or has a cleared E.Payment"
-  ],
-  "effects": ["claim enters the payable set"],
-  "requires_evidence": ["E.Bill", "E.Payment"],
-  "scope": "global",
-  "status": "candidate",
-  "support": 1,
-  "evidence": [{ "session": "<session id>", "quote": "<verbatim tool output>" }],
-  "counterexamples": []
-}
-```
+### 两道关
 
-`ONTOLOGY.md` 的初始 token 预算为 6,000，超出后会触发整合步骤。
+| 事件 | 结果 |
+| --- | --- |
+| `ADD` 一条策略元素 | `candidate`，不渲染 |
+| 实验结果符合预测 | `active` |
+| 实验结果与预测相反 | `retired`（多条规则一起测时只记录，不退役） |
+| 实验分数不变 | 不变 |
+| 复现：规则决定的字段在每一次 verify 中都获得得分 | `reproduced` |
+| 复现：字段前后都有得分 | 保留 |
+| 复现：字段在任何一次中都没有得分 | 退回 `candidate` |
+| 复现：字段在任一次 verify 中丢分 | `retired` |
+| 复现：从未与 verify 答题配对 | 退回 `candidate` |
+| `REFINE` 改变了规则内容 | 退回 `candidate`，之前的证据不再计入 |
 
-### 学习槽与运行时使用
+实验只能修改被测元素所决定的字段；脚本会比对两份答案，拒绝其他改动。单靠实验这道关是不够的：学习者可以先搜索出得分的值，再写一条规则去贴合它。复现检验的是规则本身能否带来得分，而不是那个值。
 
-初始化时，在被测 Agent 的 State 中创建 `skills/domain-ontology/` 目录，内含 `SKILL.md`、`ontology.json`、`ONTOLOGY.md` 和 `CHANGELOG.md` 四个文件，并在其 `AGENTS.md` 末尾追加一行固定的读取指令。这与 `ace-rsi-toolkit` 处理 `ace-playbook` 的方式相同。
+### 训练流程
 
-执行任务时，被测 Agent 会依次：
+每组一个持续运行的 Ontologist 会话，每次答题都是一个全新的 Actor 会话。
 
-1. 在第一次做实质操作之前，读取 `SKILL.md` 和 `ONTOLOGY.md`；
-2. 按 `entity` 元素记录的接口或数据表查询记录，遇到来源冲突时按 `precedence` 元素处理；
-3. 提交之前，把答案中的每个业务决策与对应 `action` 元素的前置条件和必需证据逐一核对；
-4. 把用到的元素 id 写进 scratchpad 中的 `ontology-used.txt`，供事后归因。
+1. **基线**：每题答一次，本体为空。
+2. **定位**：`localize` 每次删除一个字段再打分；`gaps` 按多少个任务共有来排序无分字段。
+3. **检验**：针对每个缺口，加一条决定该字段的规则，构造一个遵循它的变体答案，运行 `experiment`。
+4. **复现**：带着本体每题再答一次，然后运行 `replicate`。
+5. **完成**：`finish` 根据记录完成校验、导出和汇总。
 
-`ONTOLOGY.md` 会把 `candidate` 元素标为“未确认”。被测 Agent 必须先用数据核实这些元素，才能据此做判断。
+| 命令 | 用途 |
+| --- | --- |
+| `init`、`extract` | 创建学习槽；把 Session 的工具输出提取进证据库 |
+| `judge`、`localize`、`gaps` | 给答案打分；逐字段定位得分；跨任务排序缺口 |
+| `apply` | `ADD`、`REFINE`、`RETIRE`、`MERGE`，带 schema、引用、原文、实例和预算检查 |
+| `experiment`、`replicate` | 两道关 |
+| `finish`、`validate`、`export`、`summary` | 交付与检查 |
 
-第二阶段增加两个 Hook，两者都不在 GDPevo 的验证流程中：
+每条命令都会追加写入 `records.jsonl`，运行报告由它计算得出。
 
-- **`stop`**：任务结束时，把压缩后的 Trace 交给一个后台子会话来精炼本体，做法与 `continual-learning` 相同。
-- **`pre_tool_use`**：在可写的环境中检查动作契约。默认是观察模式，只记录、不拦截。切换到检查点模式后，第一次违反契约的调用会被拒绝，并附上理由；完全相同的调用再次发起时放行，避免一条错误的契约把 Agent 卡死。
+### 由脚本强制
 
-### 精炼循环
+以下情况都在开发版运行中实际发生过。现在由 `onto.mjs` 或 Organizer 拒绝，不再只靠说明文字约束。
 
-每完成一道任务，本体就更新一次。只有逐字引用了 Trace 原文、并且通过确定性校验的修改，才会被发布。
-
-```mermaid
-flowchart LR
-    S["完成一道任务<br/>读取当前本体"] --> E["Extract<br/>抽取交互日志"]
-    E --> P["Propose<br/>带原文引用的类型化修改"]
-    P -. 可选 .-> PB["Probe<br/>只读查询"]
-    P --> V{"Validate"}
-    V -->|通过| U["Publish<br/>执行生命周期规则"]
-    V -->|不通过| R["Reject<br/>记录被拒修改"]
-    U -->|超出预算| C["Consolidate<br/>合并、裁剪"]
-    U -->|下一题，或重做同一题| S
-
-    classDef gate fill:#e8f0fe,stroke:#1a73e8,stroke-width:2px
-    class V gate
-```
-
-1. **Extract**（脚本）：把 Actor Trace 中的任务输入、工具调用、输出和报错抽进证据库，judge 的回复也作为一条单独记录进入证据库。模型自己说的话只记入给 Ontologist 看的日志，永远不能当证据。
-2. **Propose**（Ontologist）：输出类型化的修改操作，包括 `ADD`、`REFINE`、`SCOPE`、`MERGE`、`RETIRE`、`SUPPORT`。每条操作都必须引用证据库原文。
-3. **Probe**（可选）：向业务服务发送只读查询，验证关于结构的假设。Probe 得到的引用不计入任务 support。
-4. **Validate**（脚本）：检查
-   - schema；
-   - 引用完整性，包括写在文本里的 `E.X` 形式的 id；
-   - 每条引用都能在其所注明 Session 的证据库中逐字找到；
-   - 内容中不含实例 id。实例 id 指：任务标签、任务输入中点名的 id，以及只在一个任务中出现过的记录 id。在多个任务中都出现的值属于领域的参考数据（如政策编号、费率表），可以出现；
-   - 没有超出 token 预算。
-5. **Publish**：按下表的生命周期规则合并修改，并根据 `ontology-used.txt` 和分数更新 support；随后提升 Skill 和 State 的版本号，打快照，并追加 `CHANGELOG.md`。
-6. **Consolidate**：超出预算时，合并同义元素，删除 support 最低的候选元素。
-
-| 来源 | 初始状态 | 升为 `active` 的条件 | 遇到反例时 |
-| --- | --- | --- | --- |
-| 直接从数据中观察到的结构：字段、外键、枚举值 | `active` | — | 修正或退役 |
-| 从分数推断出的策略：阈值、优先级、门控顺序 | `candidate` | 得到至少 2 个不同任务的支持，或重做同一题后分数提高 | 收窄 scope；无法收窄则退役 |
+| 发生的情况 | 组 | 现在 |
+| --- | --- | --- |
+| `finish` 之后，Ontologist 往导出目录写了一份 `PLAYBOOK.md`，并修改 `SKILL.md` 去引用它 | Financial Control | `export` 删除不是自己写的文件；Organizer 从校验过的学习槽重新导出后交付 |
+| 一次 verify 答题得 61 分（baseline 78），被标成 `rejected`，复现时被跳过 | Court Clerk | `--phase` 只接受 `baseline` 和 `verify`；从未与 verify 配对的规则退回假设 |
+| 以超出 judge 预算为由跳过复现 | Court Clerk | 复现只删除规则决定的字段，且不计入预算 |
+| 相对路径的 `--work` 把记录分成了两处 | Court Clerk | `--work` 必须等于训练配置里的 `paths.work` |
+| 第二次 verify 答题覆盖了第一次 | Court Clerk | 所有 verify 答题都计入；任何一次丢分都算有害 |
+| 大部分 judge 调用没有留下记录 | Engineering Portfolio Analytics | 每次 judge 调用都写入记录 |
 
 ### 包结构
 
 ```text
 ontology-rsi-toolkit/
-├── package.json                      # 只写 npm 字段
-├── src/index.ts                      # 声明 card、skills、hooks；构建时生成 ifaces.json
-├── icon.svg
-├── skills/ontology-rsi-toolkit/      # 实验控制器，与插件同名
-│   ├── SKILL.md
-│   ├── references/benchmark.md       # 解析 Train/Test 包和运行约定
-│   ├── references/initialization.md  # 创建学习槽和读取指令
-│   ├── references/evaluation.md      # 与容器训练类工具包共享的评估说明，逐字相同
-│   ├── references/training.md        # 容器内连续训练（Harbor）
-│   ├── references/ontologist.md      # Propose 角色说明和修改语言
-│   └── scripts/onto.mjs              # 只用 Node 内置模块：init、extract、apply、validate、render、export、diff、stats
-├── test/                             # onto.mjs 的测试
-├── skills/ontology/                  # 第二阶段：供任意 Agent 使用的日常建模 Skill
-└── hooks/                            # 第二阶段：stop.mjs、pre_tool_use.mjs
+├── src/index.ts                 # card 和 Skill 声明；构建时生成 ifaces.json
+├── skills/ontology-rsi-toolkit/
+│   ├── SKILL.md                 # Organizer：准备、训练、冻结、测试、报告
+│   ├── references/              # benchmark、初始化、训练、Ontologist、评测
+│   └── scripts/onto.mjs         # 只用 Node 内置模块
+└── test/
 ```
 
-包里不带 `domain-ontology`。它由 `onto.mjs init` 在 Target 的 State 中创建，所以重装插件永远不会碰到 Agent 已经学到的内容。
+card 的分类为 `rsi`，工具包因此出现在 Optimize 页面的 **Method** 下拉框中。`references/evaluation.md` 与其他容器训练类工具包逐字节相同。包里不带任何领域内容；`onto.mjs init` 在 Target 的 State 中创建 `skills/domain-ontology/`。
 
-训练容器里，主会话是 Ontologist。每次答题都在一个全新的 Actor 会话中进行，Actor 只能看到公开任务和学习槽的冻结副本（导出时去掉了出处信息）。默认对训练任务跑两遍：第二遍在第一遍学到的本体下重做每道题，既提供“重做后分数提高”的晋升信号，也是最后一次训练测量。导出的版本是最后一次发布的版本。
+## 评测
 
-card 的类别为 `rsi`，`preinstall` 设为 `false`。按照 PRFC-0019，只要名称和类别符合约定，工具包就会自动出现在 Method 下拉框中，并计入首页的算法数量，无需改动前端。
+### 协议
 
-### 在 GDPevo-essential 上的验证
+- `penguin-harness-benchmark` 版本 `010fda6b`；`@prismshadow/penguin-cli` 0.2.18，来自 npm（PR #16 记录中的 0.2.19 没有发布）。
+- 所有角色都用 `deepseek-flash`，thinking `max`。API 只返回别名；截至 2026-11-12，它指向 DeepSeek-V4.1-Flash-1017。
+- 每组训练一次（6 小时预算）。冻结后的 State 测试三轮，每题都在全新容器中运行。
+- 六组都使用 toolkit commit `4697d39`。
+- baseline：PR #16 的记录。在 0.2.18 上重跑 Coverage Review 的 baseline，12 格有效结果平均 56.0，公布值为 55.00。
 
-目前平均分最高的是 SkillOpt，为 70.25；基线为 56.32。
+### 结果
 
-| 任务组 | 基线 | 当前最好 | 预计契合度 | 原因 |
-| --- | --- | --- | --- | --- |
-| Service Ticket Resolution | 48.90 | 69.95（SkillOpt） | 高 | 门控顺序和动作前置条件本身就是动作契约；`test-005` 是一道审核题 |
-| Financial Control | 50.96 | 63.89（SkillAdam） | 高 | claim、bill、payment 的生命周期；引用完整性 |
-| Portfolio Management | 70.16 | 77.40（SkillOpt） | 低到中 | 瓶颈在计算和路由选择，相关政策已明确写出 |
-| Coverage Review | 55.00 | 80.67（SkillAdam） | 高 | 基线在每道题上都恰好是 55.00 分；`basis_audit` 要求写出来源优先级和记录顺序 |
-| Court Clerk Operations | 52.60 | 61.98（SkillOpt） | 中 | 规则按司法辖区划定适用范围；所有方法在 case 001 上都低于基线 |
-| Engineering Portfolio Analytics | 60.32 | 91.52（TRACE） | 中 | 结构上契合，但剩余提升空间小 |
+测试分：三轮的均值 ± 样本标准差。训练分：全新 Actor 在训练题上的得分，前为不带本体，后为带本体。规则：交付的策略元素按复现结果分类。
 
-表中分数均为 3 次测试的均值，来自 `penguin-harness-benchmark/experiments/gdpevo-essential/`（PR #16）。
+| 组 | Baseline | 测试 | 训练 | 规则（复现 / 保留） | judge 调用 | 训练成本 |
+| --- | --- | --- | --- | --- | --- | --- |
+| Coverage Review | 55.00 | 58.33 ± 2.89 | 84.6 → 93.4 | 3 / 6 | 225 | $0.83 |
+| Service Ticket Resolution | 48.90 | 85.10 ± 0.35 | 88.2 → 94.1 | 4 / 5 | 255 | $0.78 |
+| Financial Control | 50.96 | 63.42 ± 0.94 | 73.9 → 92.0 | 4 / 2 | 416 | $0.53 |
+| Court Clerk Operations | 52.60 | 52.21 ± 3.65 | 86.5 → 87.6 | 1 / 0 | 658 | $0.59 |
+| Portfolio Management | 70.16 | 75.07 ± 2.29 | 71.9 → 90.5 | 5 / 9 | 571 | $1.05 |
+| Engineering Portfolio Analytics | 60.32 | 72.55 ± 0.00 | 43.9 → 100 | 10 / 4 | 430 | $1.10 |
+| **均值** | **56.32** | **67.78 ± 0.60** | | | | **$4.87** |
 
-#### Hypotheses
+- 30 道测试题中有 24 道不低于该题的 baseline 均分。
+- 交付的规则在复现中没有一条有害。Engineering Portfolio Analytics 有两条规则被实验证伪，没有到达任何 Actor。
+- Court Clerk 在训练上提升很小（86.5 → 87.6），只有一条规则通过两道关，测试与 baseline 持平。
 
-均分只能说明本工具包有没有用；下面五个假设用来检验它是不是出于 Motivation 中所说的原因而有用。每个假设都给出了 PR #16 中的参照值，并写明假设不成立时得出什么结论。
+每次运行之间的波动很大。此前用开发版 toolkit 完整跑过一次，六组均分 69.11；两次运行在单组上最多相差 21.7 分（Coverage Review：80.00 对 58.33）。按 benchmark 协议每组只训练一次，得到的是一个噪声较大的估计。
 
-| # | 假设 | 衡量方式 | 参照值（PR #16） | 若不成立 |
-| --- | --- | --- | --- | --- |
-| H1 | 领域知识迁移时损失更小 | 训练 − 测试差距 | 14.7–27.8 | 类型化知识和规则一样会过拟合；需要收紧生命周期阈值 |
-| H2 | 类型化知识可以组合 | case 005 的提升 ÷ case 001–004 的提升 | −0.13（OpenSkill）到 0.57（TRACE） | 类型带来的好处不在组合能力上；撤回这一论断 |
-| H3 | 门控能限制有害知识 | 低于基线的测试题数 | 30 道中 5–10 道 | candidate 状态挡不住有害知识；改为不在渲染视图中展示 candidate |
-| H4 | 提升集中在结构性强的组 | Coverage Review、Financial Control、Service Ticket Resolution 的提升高于 Portfolio Management | — | 提升另有来源，并非来自对领域的建模 |
-| H5 | 类型本身有作用 | 相同循环下，类型化本体对比自由文本笔记（消融实验） | — | 提升只来自证据门控；只保留循环，去掉类型 |
+## 不变量
 
-测试共 30 道题、重复 3 次，结果按题与基线做配对差值，并给出 bootstrap 区间。H2 只基于 6 道组合题，结论只能作为参考，不能视为定论。
+- 每个未退役的元素都引用了原文；每条 active 的策略元素都有一条记录在案的确认实验。
+- rubric、参考答案和 verifier 输出都不进入循环。唯一的反馈是训练 judge 的分数。
+- Actor 在已发布本体上的每次答题都计入，不重新标记、不丢弃、不覆盖。
+- 导出的训练答案是 Actor 自己的答案；实验用的变体答案从不提交。
+- 包里不含领域内容。
 
-#### Protocol
+## 局限
 
-- **配置**：DeepSeek-V4.1-Flash-1017，thinking 设为 max，PenguinHarness 0.2.19，与 PR #16 一致。
-- **训练**：每组一个容器、一个会话，时间预算 6 小时。5 道训练题按顺序完成，期间可以调用 judge。每做完一题精炼一次本体，最后导出 `skill/`。
-- **测试**：冻结 `skill/`，每道题使用一个新容器，关闭 judge，重复 3 次。
-- **报告**：每组及总体的均值和样本标准差；H1–H5 的结果；训练和测试的成本与 token 用量；根据 `ontology-used.txt` 统计被测 Agent 用到了哪些元素。
-- **成本**：6 组训练加 3 × 30 次测试，约 11–14 美元；重跑基线约另加 7.5 美元，H5 消融约另加 12 美元。以上按现有实验记录和 DeepSeek Flash 的标价估算。
+- 需要一个能对提交答案打分的 judge。没有它，实验这道关无法使用。
+- 每类任务只有一道训练题，规则的提出、检验和复现都在同一道题上完成。两道关都无法区分“关于这类任务的规则”和“关于这一道题的规则”，也没有任何机制阻止只在一道题上确认的规则声明为 `global`。这是训练与测试差距的主要来源。
+- 只按整节打分的部分，拿不到逐字段的信号。
+- 探索本质上是在 judge 上搜索。复现限制了搜索结果能交付什么；每组的 judge 调用次数都如实报告。
+- `ONTOLOGY.md` 每题最多增加约 6k token 的上下文。
 
-结果按 RFC-0002 的格式，作为 6 个实验提交到 `experiments/gdpevo-essential/`。
+## 其他方案
 
-### Awesome RSI 分类
+- **重跑分数上升就接受**（SkillOpt、SkillAdam）：要花 agent 运行的成本，归因也差。第一版就是这样做的。
+- **只做实验**：能说明值是对的，不能说明规则能产生这个值。
+- **只做复现**：不需要 judge，但每条错误规则都会先到达 agent。
+- **自由文本笔记**：没有声明的可观测对象，无法做实验。
 
-`experiment.yaml` 中记录：
+交付方式：
 
-```yaml
-dimensions:
-  artifact: [Non-parametric, Context, Memory]
-  mode: [Offline, Online]          # GDPevo 上为 Offline；第二阶段的 stop hook 为 Online
-  topology: [Sequential]
-  selection: [Artifact validation, Instance result]
-  updater: [Teacher]               # Ontologist 作为独立角色运行
-  source: [Train/dev set, Environment]
-  feedback: [Score, Non-binary, Non-score, Other]
-  frequency: [Trajectory]
-  scope: [Specialized]
-```
-
-## Invariants
-[invariants]: #invariants
-
-### Evidence-bound elements
-
-> 每个未退役的元素都至少引用一段原文，且这段原文能在被测 Agent 的 Trace 中逐字找到。
-
-Validate 在每次发布时都会检查这一点。没有这条约束，本体就无法审计，Ontologist 产生的幻觉也会被写成看起来像事实的规则。
-
-### No private scoring material
-
-> 任何来自 `rubric/`、标准答案或评测器私有输出的内容，都不会进入精炼循环。唯一的反馈是训练 judge 返回的内容，即分数和对错反馈，这是 benchmark 明确开放给训练使用的。Actor 永远看不到它。
-
-这是所有工具包都遵守的信息隔离原则（*Self-Improvement › The information barrier*）。一旦被打破，测试分数就失去了意义。
-
-### Data-free package
-
-> 发布的插件包不含任何领域本体内容；学习槽中的每个元素，都是精炼循环根据该 Agent 自身的运行记录生成的。
-
-这正是社区 RFC-0003 要求的算法与数据解耦。没有这条约束，工具包就会夹带 benchmark 知识，测出的分数也不能代表它在其他场景下的表现。
-
-## Drawbacks
-[drawbacks]: #drawbacks
-
-- `ONTOLOGY.md` 会让每个任务多出最多约 6k token 的上下文。
-- 抽取质量取决于模型。candidate 状态能限制错误元素的影响，但不能完全消除。
-- GDPevo 的业务服务是只读的，所以这个 benchmark 测不到 `pre_tool_use` 契约检查的效果。
-- 每组只有 5 道训练题。support 阈值暂定为 2，需要在冒烟实验中验证是否合适。
-- 如果交付采用方案 A，源码将位于社区仓库之外。
-
-## Rationale and alternatives
-[rationale-and-alternatives]: #rationale-and-alternatives
-
-- **用自由文本笔记代替类型化元素。** 这是 ACE 和基于 Skill 的工具包的做法，H5 会直接测量两者的差别。
-- **每次修改都用验证集筛选（EvoOntology 的做法）。** GDPevo 没有验证集。SkillOpt 在声明的适配中改用训练集做筛选，正好会遇到 Motivation 中描述的分数饱和问题。基于计数的 support 和反例不依赖验证集。
-- **用 YAML 存储。** YAML 更易读，但 Hook 脚本必须引入外部依赖才能解析它。可读性已经由渲染出的 `ONTOLOGY.md` 解决。
-- **拆成两个插件：** 一个 `rsi` 工具包，加一个日常建模用的产品插件。合成一个包，安装更简单；如果维护者希望 `rsi` 类别只放算法工具包，可以再拆开。
-- **交付方式：**
-
-| 方案 | 做法 | 优点 | 缺点 |
-| --- | --- | --- | --- |
-| A：独立仓库 + 索引条目（建议） | 源码放在贡献者的 GitHub 仓库，在 GitHub Release 中附上 `npm pack` 生成的压缩包，再向 `penguin-harness-plugins` 提交一个 `manifest.toml` 条目 | 符合索引仓库 CONTRIBUTING 的要求；作者自己负责发版 | 源码不在社区仓库中；发版依赖贡献者本人 |
-| B：内置插件 | 向 `penguin-harness/plugins/ontology-rsi-toolkit/` 提交 PR | 与现有 9 个工具包放在一起，受 core 测试保护 | 任务指定的目标仓库是 `penguin-harness-plugins`；新增内置插件需要维护者同意 |
-| C：把源码目录放进 `penguin-harness-plugins` | 按社区 RFC-0003 的描述，在仓库根目录建立 `<plugin-id>/` | 与 RFC 原文一致 | harness 已不再读取这种格式，而且与索引仓库的设计冲突 |
-
-## Prior art
-[prior-art]: #prior-art
-
-| 方法 | 学到的产物 | 保留机制 | 区别 |
-| --- | --- | --- | --- |
-| [ACE](https://arxiv.org/abs/2510.04618) | 逐条列出规则的 playbook | 只增不删，记录 helpful / harmful 次数 | 自由文本，不关联实体，也不要求证据 |
-| [SkillOpt](https://arxiv.org/abs/2605.23904)、[TRACE](https://arxiv.org/abs/2608.22793) | Skill 或 Skill 库 | 按训练分数筛选 | 同上 |
-| [EvoOntology](https://arxiv.org/abs/2609.15779) | 数据 Agent 的本体层：内容、schema、工具接口 | 每次只改一处，在验证任务上成对比较 | 依赖验证集；没有显式的动作契约和生命周期 |
-| [EvoBelief](https://arxiv.org/abs/2610.12789) | 可证伪的世界模型规则 | 经独立验证后才启用，遇到反例就收窄适用范围或退役 | 生命周期思路相同，本方案把它用于类型化的业务本体 |
-| [TTSE](https://arxiv.org/abs/2609.24289) | 分开的 FACT 库与 TIP 库 | 按批次归因失败，退役有误导性的规则 | 已在 GDPevo 上做过消融；它把 FACT 和 TIP 分开，是“区分观察到的结构与推断出的策略”这一思路最接近的先例 |
-| [HarnessMM](https://arxiv.org/abs/2610.32813) | 带守卫条件的可执行决策图 | 用验证集选择配置 | 目标是降低 token 成本，而不是领域建模 |
-
-以上对比仅依据论文摘要。EvoOntology、EvoBelief、TTSE 三篇会在 P0 阶段精读全文，并在提交 PR 前更新本节。[#36](https://github.com/Prism-Shadow/penguin-harness-community/issues/36)（知识库插件）负责文档与检索，本工具包负责类型与契约。
-
-## Unresolved questions
-[unresolved-questions]: #unresolved-questions
-
-1. 交付方式选 A、B 还是 C？
-2. 社区 RFC-0003 是否要按 PRFC-0003 v1.1.0 更新？可以随本工作一并提交修订 PR。
-3. 实验口径：
-   - benchmark 用哪个 commit？基线跑在 `53f779e8` 上，SkillOpt 跑在 `457400e8` 上，而当前题面固定在 `010fda6b`。
-   - 模型名写作 `DeepSeek-V4.1-Flash-1017`（已发布记录的写法），还是 `deepseek-flash-1017`（RFC-0002 示例的写法）？
-   - thinking 用 `max`（已发布记录）还是 `high`（workflow 指南）？
-4. 直接复用 PR #16 的基线，还是在选定的 commit 上重跑？
-5. 名称 `ontology-rsi-toolkit` 和 `rsi` 类别是否合适？
-6. 第二阶段的 Hook 是否属于 #37 的范围，还是另开任务？
-
-## Future possibilities
-[future-possibilities]: #future-possibilities
-
-- **Stage 2**：关联了证据的类型化契约，可以在筛选合成轨迹时用作检查条件，也可以作为 agentic RL 中可验证的奖励项。Stage 2 路线图中都提到了这两个方向。
-- **Workbench**：做一个 Ontology Explorer，在对话旁边浏览本体图谱和变更记录。
-- **共享本体**：同一 Project 中的多个 Agent 共用一份本体，与 penguin-harness#308（项目级共享 Skill）相关。
-- **可写的 benchmark**：如果有业务服务可写的 benchmark，就能测量 `pre_tool_use` 检查点的效果。
-
-## Schedule
-[schedule]: #schedule
-
-| 阶段 | 工作内容 | 日期（2026） |
+| 方案 | 做法 | 取舍 |
 | --- | --- | --- |
-| P0 | 确认待决问题；精读 EvoOntology、EvoBelief、TTSE 全文 | 11/12–11/15 |
-| P1 | 本体模型、脚本、学习槽、训练参考文档、实验控制器 | 11/16–11/23 |
-| P1 | 选一组做冒烟实验（Coverage Review 或 Financial Control），结果同步到 #37 | 11/24–11/26 |
-| P1 | 6 组完整实验 | 11/27–12/03 |
-| P2 | Hook 和日常建模 Skill，与完整实验并行 | 11/30–12/06 |
-| P3 | H5 消融 | 12/04–12/09 |
-| — | 提交 PR | 12/07 |
-| — | 认领宽限期结束 | 12/11 |
+| A（当前） | 独立仓库；GitHub Release 提供压缩包；在 `penguin-harness-plugins` 中加条目 | 符合索引的设计；源码不在 Prism-Shadow 下 |
+| B | `penguin-harness/plugins/ontology-rsi-toolkit/` | 和其他工具包放在一起；需要维护者同意 |
+
+包的结构保证改为 B 时只需移动目录。
+
+## 相关工作
+
+| 方法 | 如何保留一次修改 | 区别 |
+| --- | --- | --- |
+| [ACE](https://arxiv.org/abs/2510.04618) | Reflector 的 helpful/harmful 计数 | 功劳由模型对整次运行的判断决定 |
+| [SkillOpt](https://arxiv.org/abs/2605.23904)、SkillAdam | 重跑均分必须上升 | 按整次重跑归因 |
+| [TRACE](https://arxiv.org/abs/2608.22793) | 对比成功和失败的轨迹；按训练分选检查点 | 按轨迹组归因 |
+| [EvoOntology](https://arxiv.org/abs/2609.15779) | 在验证集上两两比较 | 需要验证集；没有动作契约 |
+| [EvoBelief](https://arxiv.org/abs/2610.12789) | 使用前验证；反例使规则退役 | 思路最接近；这里的检验是修改输出 |
+| [TTSE](https://arxiv.org/abs/2609.24289) | 批量失败归因；FACT/TIP 两个库 | 把结构和策略分开的最直接先例 |
+
+## 待定问题
+
+1. 交付方式：A 还是 B？
+2. 0.2.19 没有发布，用 penguin-cli 0.2.18 跑的结果能否作为排行榜条目？
+3. `references/evaluation.md` 列了四个方法名，且必须在各工具包间逐字节相同。是否加入 `ontology`？
+4. adapter 在 0.2.18 上有启动竞态（设置轮数上限时返回 503，状态 `config_failed`），这些运行中 231 个 trial 里出现了 4 次。在 `helper.mjs` 里加一次短暂重试即可消除。
+5. 插件索引要求导出 `activate`，而自 PRFC-0003 v1.1.0 起，纯内容插件（包括 harness 自带的所有 RSI 工具包）都没有这个导出。索引是否应接受这类插件？

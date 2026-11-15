@@ -43,4 +43,13 @@ import type { Plugin } from "@prismshadow/penguin-core/plugin";
 })
 export class OntologyRsiToolkitPlugin {}
 
-export default { modules: [OntologyRsiToolkitPlugin] } satisfies Plugin;
+const plugin: Plugin = { modules: [OntologyRsiToolkitPlugin] };
+export default plugin;
+
+/**
+ * The plugin index reads this named export statically to check the entry contract; the
+ * harness's own loader uses the default export above.
+ */
+export function activate(): Plugin {
+  return plugin;
+}

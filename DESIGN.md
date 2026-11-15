@@ -1,420 +1,204 @@
 # Ontology RSI Toolkit
 
-- Feature Name: `ontology-rsi-toolkit`
-- Start Date: 2026-11-11
 - Quest: RSI-Q008, [penguin-harness-community#37](https://github.com/Prism-Shadow/penguin-harness-community/issues/37)
 - Author: EonHao
-- Status: draft, for maintainer review
+- Status: implemented; evaluated on all six GDPevo-essential groups
 
 [中文版](DESIGN.zh.md)
 
 ## Summary
-[summary]: #summary
 
-Training tasks and test tasks share a domain, not a task. Self-evolution should therefore learn a model of that domain. This proposal is an RSI toolkit that keeps a typed domain ontology for an agent and refines it from the agent's own Traces.
+Training and test tasks in GDPevo share a domain, not a task. This toolkit learns that domain as a typed ontology kept in the Target's Agent State: entities, relations, lifecycles, source precedence, action contracts and constraints.
 
-An ontology has six element kinds:
-- entity types
-- relations
-- state lifecycles
-- source precedence
-- action contracts
-- constraints
+The hard part is deciding which rules are right. Existing toolkits rerun the agent with a candidate and compare total scores. That signal mixes the rule's effect with run-to-run variance and with every other rule in context. This toolkit tests each rule directly instead:
 
-Every element must cite text that appears verbatim in a Trace. Elements move through a `candidate → active → retired` lifecycle driven by counted support and counterexamples.
+1. A policy rule names the answer fields it `decides`.
+2. **Experiment.** The script edits those fields in a saved answer, asks the training judge, and compares scores against a prediction fixed in advance. No model runs. A refuted rule is retired before any agent reads it.
+3. **Replication.** Fresh agents solve the tasks with only the ontology. A rule stays only if they keep or gain credit on its fields; it is retired if they lose any.
 
-The ontology is stored in a learning slot of the Target's Agent State, the same mechanism the ACE and AWM toolkits use. The package ships no domain content.
+Structure (entities, relations, lifecycles) is published on a verbatim quote of what the environment returned.
 
-Validation runs on GDPevo-essential with DeepSeek-V4.1-Flash-1017, under the protocol of the existing leaderboard entries. The evaluation tests five stated hypotheses, not only the mean score.
+On GDPevo-essential the six-group test mean goes from 56.32 (baseline) to 67.78 ± 0.60.
 
 ## Motivation
-[motivation]: #motivation
 
-### What transfers from a training task to a test task
+### What transfers
 
-GDPevo-essential pairs each training task with a test task of the same kind. `train-00k` and `test-00k` differ only in entities, dates or jurisdictions. `test-005` often combines earlier kinds:
-- In Financial Control, it combines reimbursement exposure with prepaid-to-GL variance.
-- In Service Ticket Resolution, it audits proposed updates against the same status, routing and evidence rules.
+`train-00k` and `test-00k` are the same kind of task with different records. They share record types, how records link and change state, which source wins, and which decisions are allowed. Instance values do not carry over.
 
-The two splits share the domain:
-- the record types;
-- how records link and change state;
-- which source is authoritative;
-- which decisions are allowed under which conditions.
+### Why a total score cannot credit a rule
 
-Instance values do not carry over. Anything a learner stores beyond the domain cannot help on the test split, and it can hurt.
+The first version of this toolkit promoted a rule when a retry scored higher. On Coverage Review the training mean fell from 89.9 to 83.0, and the test mean was 59.33 against a baseline of 55.00.
 
-### Where current learners lose this
+The judge returns one number per answer. Replaying the saved answers with one field changed at a time (113 judge calls, no model) showed:
 
-The four published methods learn free-text rules or Skills, and they keep an edit when the training score rises. This has two consequences.
+- All five training answers lost credit in the same four fields, the `basis_audit` section every task in the group shares. The learner had spent its budget describing 18 entities.
+- Each of the two regressions came from one field set by one wrong rule (−16.7 and −18.2).
 
-**An edit mixes domain knowledge with instance coincidence.** The training score cannot tell the two apart, because both raise it.
+One judge call per rule would have refuted both before any agent saw them.
 
-**The training score saturates.** The judge returns one number per task, and each group has five training tasks. Five of the 24 recorded training runs end at exactly 100. From that point on, the score carries no information, but the rule set can keep changing.
+### Why types
 
-The PR #16 records show the result. Each value is a mean over the six groups.
+A typed rule has an observable: `decides: [basis_audit.controlling_record_ids]` ties it to the field it sets, so it can be tested in isolation. A paragraph of free text cannot. Types also separate the domain from instances: the script rejects content that names a task, an id from a task's input, or a record id seen in only one task.
 
-| Method | Test mean | Final training mean | Train − test gap | Gain on case 005 | Gain on cases 001–004 | Test cases below baseline |
-| --- | --- | --- | --- | --- | --- | --- |
-| SkillAdam | 68.95 | 90.0–100 | 27.8 | +6.6 | +14.1 | 6 of 30 |
-| SkillOpt | 70.25 | 95.1–100 | 27.4 | +2.0 | +16.9 | 5 of 30 |
-| TRACE | 68.02 | 80.6–94.3 | 18.3 | +7.3 | +12.8 | 8 of 30 |
-| OpenSkill | 62.16 | 46.8–88.1 | 14.7 | −1.0 | +7.5 | 10 of 30 |
+## Design
 
-Training means are measured inside the training session with the judge available, so the gap is not a clean measure of overfitting. The last three columns use the test protocol only, and they show the same pattern:
-- Gains shrink on the composite case.
-- Every method scores below the baseline on 5 to 10 of the 30 test cases.
-  - On Court Clerk case 001, all four methods do.
-  - On Financial Control case 005, SkillOpt loses 31.7 points.
+### Ontology
 
-The [GDPevo report](https://penguin.ooo/blog/gdpevo-self-evolution) traces one instance of this to its rules. In Court Clerk Operations, later SkillAdam edits added "Delay contract cases 14d & skip Fridays". This is a coincidence of five training tasks, written as policy.
+`ontology.json` is the source of truth; `ONTOLOGY.md` is rendered from it for the Target and shows active elements only, within 6,000 tokens.
 
-### What a typed domain model changes
-
-1. **It separates domain from instance by construction.** Knowledge attaches to a type, such as `E.Claim` or `A.approve_payment`. Validate rejects any edit that names an instance or a case. A coincidence can enter only as a claim about a type, and then it has to survive point 2.
-2. **It makes evidence countable.** When two tasks support the same rule, they produce two `SUPPORT` operations on the same id. Support and counterexamples become exact counts. No embedding model is needed, and no validation split, which GDPevo does not have.
-3. **It takes supervision from observations as well as scores.** Every tool output is an observation of the domain: a schema, a status, a link. Structure that is observed directly is accepted after one observation. Only inferred policy waits for scores and repeated support. Because GDPevo services are read-only, a query can test a hypothesis without affecting the task. Observations say what the domain is; scores say whether a decision was right.
-4. **It composes.** A task that combines two earlier kinds needs the entities and contracts of both, and a typed model returns them by lookup. A workflow learned for each kind separately does not compose this way.
-5. **It turns policy into a check.** Contracts give the agent a checklist to run before it submits. Checking a decision against an explicit rule is usually an easier task for a model than producing the right decision under an unstated one. The audit task in Service Ticket Resolution `test-005` is such a check.
-
-The evaluation states each of these as a hypothesis and tests it (*Hypotheses* below).
-
-### Fit with the roadmap
-
-Stage 1 of the community roadmap evolves the harness and leaves model weights fixed. It favours artifacts that people can read, audit and roll back, and that transfer across models. A typed ontology is the most structured artifact of this kind, because a script can check every element. The toolkit contributes to two Stage 1 tracks:
-- **Framework**: a new toolkit.
-- **Data**: six GDPevo-essential entries in the RFC-0002 format.
-
-Judging by the catalog summaries, none of the 131 methods in Awesome RSI learns an action model of the precondition-and-effect kind. The closest, EvoOntology, needs a validation split.
-
-## Guide-level explanation
-[guide-level-explanation]: #guide-level-explanation
-
-The toolkit is installed on the agent that runs the experiment. It then appears under **Method** in the Optimize tab of the Evaluation Center, next to the other toolkits. It can also be started from a prompt:
-
-```text
-Use the `ontology-rsi-toolkit` Skill to train agent `reviewer` on Benchmark
-`gdpevo-essential-coverage-review-train`, then measure the frozen ontology on
-`gdpevo-essential-coverage-review-test`.
-```
-
-The Skill follows the same sequence as the other toolkits:
-1. Initialize the learning slot in the Target.
-2. Measure H1.
-3. Run the refinement loop over the training cases.
-4. Freeze the ontology.
-5. Measure it on the test Benchmark.
-
-After training, the Target's State contains `skills/domain-ontology/`. The Target reads a rendered view, `ONTOLOGY.md`, before its first substantive action. An excerpt (the content is learned, not shipped):
-
-```markdown
-## Actions
-### A.approve_payment · active · support 3
-Params: claim: E.Claim
-Requires: claim.status == approved; no linked E.Bill is void or has a cleared E.Payment
-Evidence to fetch: E.Bill, E.Payment
-
-## Precedence
-### P.current_over_export · candidate · support 1 · verify against data first
-Current clinical records (documents.is_current = true) override the stale export.
-```
-
-Phase 2 adds two parts for agents that work outside benchmarks:
-- a `skills/ontology` Skill for everyday modelling;
-- two hooks, described below.
-
-## Reference-level explanation
-[reference-level-explanation]: #reference-level-explanation
-
-### Constraints from the current codebase
-
-| # | Fact | Source | Consequence |
-| --- | --- | --- | --- |
-| 1 | The `penguin` block in `package.json`, as described in community RFC-0003, is no longer read. There is no fallback. | `penguin-harness/rfcs/PRFC-0003-plugin.md` v1.1.0 (2026-11-04) | The package declares its content with `@Component({contributes})` in `src/index.ts`, and the build emits `ifaces.json`. Community RFC-0003 is out of date. |
-| 2 | `penguin-harness-plugins` is an index. Each entry is a `manifest.toml` that points to an npm package or a GitHub Release tarball. | That repository's `README.md` and `CONTRIBUTING.md` | The source needs its own home. See *Delivery*. |
-| 3 | All 12 GDPevo-essential task groups declare `state_mode: read_only`. | `task_group.yaml` in each group of `penguin-harness-benchmark` | On GDPevo, contracts constrain the decisions written into the answer, not tool calls that change state. |
-| 4 | A Harbor test loads only the frozen `skill/` folder and one reader line. | Benchmark `README.md`; `skilladam-rsi-toolkit` `initialization.md` | The ontology ships as files inside `skill/`. The validation path does not depend on hooks. |
-| 5 | Reinstalling a plugin replaces `skills/<name>/` entirely. A confining sandbox blocks writes to Agent State. | Docs: *Skills › Installation and storage*; *Settings › Sandbox* | Learned data lives in a slot owned by the Target. A write that fails is staged in the scratchpad. |
-
-### Ontology model
-
-`ontology.json` is the single source of truth. The toolkit renders `ONTOLOGY.md` from it for the model to read. The file is JSON rather than YAML because hook and Skill scripts may use only Node built-ins, and Node has no built-in YAML parser.
-
-| Kind | Holds | Example from GDPevo |
+| Kind | Holds | Published on |
 | --- | --- | --- |
-| `entity` | Fields, key, enums, and the endpoint or table where instances live | Record types of each group's business service |
-| `relation` | Foreign keys and cardinality | claim → bill → payment (Financial Control) |
-| `lifecycle` | Legal state transitions | Claim, bill and payment statuses |
-| `precedence` | Which source wins when two sources disagree | `basis_audit.source_precedence` (Coverage Review); book of record versus a stale worksheet (Portfolio Management) |
-| `action` | Parameter types, preconditions, effects, required evidence, gate order, failure signatures | Gate order and action choice (Service Ticket Resolution) |
-| `constraint` | Invariants such as reconciliations, thresholds and effective dates, each with a scope | Fee rules scoped by jurisdiction (Court Clerk Operations) |
+| `entity` | Fields, key, enums, where instances live | A quote |
+| `relation` | Foreign keys, cardinality | A quote |
+| `lifecycle` | Legal state transitions | A quote |
+| `precedence` | Which source wins | Experiment, then replication |
+| `action` | What a decision requires, in which order | Experiment, then replication |
+| `constraint` | Invariants: totals, thresholds, dates | Experiment, then replication |
 
-Every element carries these fields:
-- `id`: stable, never reused
-- `kind`
-- `scope`
-- `status`: `candidate`, `active` or `retired`
-- `support`: the number of distinct tasks that support the element
-- `evidence`: a list of `{session, quote}` pairs
-- `counterexamples`
+Policy elements carry `decides`, a list of answer paths; `rows.status` covers the `status` of every record in `rows`. Evidence is one of `quote` (verbatim tool output from a named Session), `experiment` (an entry in `experiments.jsonl`) or `replication` (an entry in `replications.jsonl`). `validate` checks every one against the records.
 
-```json
-{
-  "id": "A.approve_payment",
-  "kind": "action",
-  "params": { "claim": "E.Claim" },
-  "preconditions": [
-    "claim.status == approved",
-    "no linked E.Bill is void or has a cleared E.Payment"
-  ],
-  "effects": ["claim enters the payable set"],
-  "requires_evidence": ["E.Bill", "E.Payment"],
-  "scope": "global",
-  "status": "candidate",
-  "support": 1,
-  "evidence": [{ "session": "<session id>", "quote": "<verbatim tool output>" }],
-  "counterexamples": []
-}
-```
+### The gates
 
-`ONTOLOGY.md` starts with a token budget of 6,000. When the budget is exceeded, the consolidation step runs.
+| Event | Effect |
+| --- | --- |
+| `ADD` a policy element | `candidate`; not rendered |
+| Experiment moves as predicted | `active` |
+| Experiment moves the other way | `retired` (a bundle is only recorded) |
+| Experiment does not move | unchanged |
+| Replication: a decided field gains credit in every verify attempt | `reproduced` |
+| Replication: fields had credit before and after | stays |
+| Replication: fields had credit in no attempt | back to `candidate` |
+| Replication: a field loses credit in any verify attempt | `retired` |
+| Replication: never paired with a verify attempt | back to `candidate` |
+| `REFINE` that changes the rule | back to `candidate`; earlier evidence no longer counts |
 
-### Learning slot and runtime use
+An experiment may change only fields the tested elements decide; the script diffs the two answers and refuses anything else. The experiment gate alone is weak: a learner can find a value by search and then write a rule to fit it. Replication checks that the rule, not the value, carries the credit.
 
-Initialization creates `skills/domain-ontology/` in the Target's State, with four files:
-- `SKILL.md`
-- `ontology.json`
-- `ONTOLOGY.md`
-- `CHANGELOG.md`
+### Training loop
 
-It also appends one fixed reader line to the Target's `AGENTS.md`, the same way `ace-rsi-toolkit` sets up `ace-playbook`.
+One continuing Ontologist session per group; each attempt is a fresh Actor session.
 
-During a task, the Target:
-1. reads `SKILL.md` and `ONTOLOGY.md` before its first substantive action;
-2. looks up records through the endpoints and tables named in `entity` elements, and resolves conflicting sources with `precedence` elements;
-3. before submitting, checks every business decision in its answer against the preconditions and required evidence of the matching `action` element;
-4. writes the ids of the elements it relied on to `ontology-used.txt` in its scratchpad, so that they can be credited later.
+1. **Baseline.** One attempt per task, empty ontology.
+2. **Map.** `localize` removes one field at a time and re-judges; `gaps` ranks fields without credit by how many tasks share them.
+3. **Test.** For each gap: add a rule that decides the field, build a variant that follows it, run `experiment`.
+4. **Replicate.** One attempt per task with the ontology, then `replicate`.
+5. **Finish.** `finish` validates, exports and summarizes from the records.
 
-`ONTOLOGY.md` marks `candidate` elements as unconfirmed. The Target must check them against data before relying on them.
+| Command | Purpose |
+| --- | --- |
+| `init`, `extract` | Create the slot; pull a Session's tool outputs into the corpus |
+| `judge`, `localize`, `gaps` | Score an answer; map credit per field; rank gaps across tasks |
+| `apply` | `ADD`, `REFINE`, `RETIRE`, `MERGE`, with schema, reference, quote, instance and budget checks |
+| `experiment`, `replicate` | The two gates |
+| `finish`, `validate`, `export`, `summary` | Deliver and check |
 
-Phase 2 adds two hooks. Neither is on the GDPevo validation path.
-- **`stop`**: when a task ends, hands a condensed Trace to a background subagent that refines the ontology. It follows the same pattern as `continual-learning`.
-- **`pre_tool_use`**: checks action contracts in environments that can be written to.
-  - In the default observe mode, it only records.
-  - In checkpoint mode, it denies the first call that violates a contract and states the reason. An identical retry is allowed through, so a wrong contract cannot block the agent.
+Every command appends to `records.jsonl`; the run report is computed from it.
 
-### Refinement loop
+### Enforced by the script
 
-The ontology is updated after every task. An edit is published only if it quotes the Trace verbatim and passes deterministic validation.
+Each of these happened in the development run and is now refused by `onto.mjs` or the Organizer rather than left to the instructions.
 
-```mermaid
-flowchart LR
-    S["Solve a task<br/>reads current ontology"] --> E["Extract<br/>interaction log"]
-    E --> P["Propose<br/>typed edits with quotes"]
-    P -. optional .-> PB["Probe<br/>read-only queries"]
-    P --> V{"Validate"}
-    V -->|pass| U["Publish<br/>apply lifecycle"]
-    V -->|fail| R["Reject<br/>log the edit"]
-    U -->|over budget| C["Consolidate<br/>merge, prune"]
-    U -->|next task, or retry the same task| S
+| Observed | Group | Now |
+| --- | --- | --- |
+| After `finish`, the Ontologist wrote a `PLAYBOOK.md` into the export folder and edited `SKILL.md` to cite it | Financial Control | `export` deletes files it did not write; the Organizer deploys a fresh export of the validated slot |
+| A verify attempt that scored 61 against a baseline of 78 was labelled `rejected` and skipped by replication | Court Clerk | `--phase` accepts `baseline` and `verify` only; a rule never paired with a verify attempt is demoted |
+| Replication was skipped because it would exceed the judge budget | Court Clerk | Replication knocks out decided fields only and is not budgeted |
+| A relative `--work` split the records in two | Court Clerk | `--work` must equal the request's `paths.work` |
+| A second verify attempt replaced the first | Court Clerk | All verify attempts count; a loss in any is a harm |
+| Most judge calls left no record | Engineering Portfolio Analytics | Every judge call is recorded |
 
-    classDef gate fill:#e8f0fe,stroke:#1a73e8,stroke-width:2px
-    class V gate
-```
-
-1. **Extract** (script): pulls the task input, tool calls, outputs and errors from the Actor's Trace into a corpus, and the judge's reply into a second corpus entry. The model's own text is logged for the Ontologist but never becomes evidence.
-2. **Propose** (the Ontologist): returns typed edit operations: `ADD`, `REFINE`, `SCOPE`, `MERGE`, `RETIRE` and `SUPPORT`. Every operation must quote the corpus.
-3. **Probe** (optional): sends read-only queries to the business service to test a hypothesis about structure. Probe quotes never count as task support.
-4. **Validate** (script): checks
-   - the schema;
-   - referential integrity, including `E.X`-style ids written in text;
-   - that each quote appears verbatim in the corpus of the Session it names;
-   - that no instance id appears in content. An instance id is a task label, an id the task's own input names, or a record id seen in one task only. A value seen across tasks is reference data of the domain (a policy code, a rate table) and may be named;
-   - the token budget.
-5. **Publish**: applies the lifecycle rules below and updates support using `ontology-used.txt` and the score. It then bumps the Skill and State versions, takes a snapshot and appends to `CHANGELOG.md`.
-6. **Consolidate**: when the budget is exceeded, merges synonymous elements and drops the lowest-support candidates.
-
-| Origin | Initial status | Promoted to `active` when | On a counterexample |
-| --- | --- | --- | --- |
-| Structure observed directly in data: fields, foreign keys, enums | `active` | — | Corrected or retired |
-| Policy inferred from scores: thresholds, precedence, gate order | `candidate` | Supported by at least 2 distinct tasks, or a retry of the same task scores higher | Scope narrowed; retired if the scope cannot be narrowed |
-
-### Package layout
+### Package
 
 ```text
 ontology-rsi-toolkit/
-├── package.json                      # npm fields only
-├── src/index.ts                      # card, skills and hooks contributions; build emits ifaces.json
-├── icon.svg
-├── skills/ontology-rsi-toolkit/      # experiment controller, named after the plugin
-│   ├── SKILL.md
-│   ├── references/benchmark.md       # resolves the Train/Test packages and run contract
-│   ├── references/initialization.md  # creates the slot and the reader line
-│   ├── references/evaluation.md      # byte-identical to the shared container-training reference
-│   ├── references/training.md        # in-container continuous training (Harbor)
-│   ├── references/ontologist.md      # the Propose role and the edit language
-│   └── scripts/onto.mjs              # Node built-ins only: init, extract, apply, validate, render, export, diff, stats
-├── test/                             # tests of onto.mjs
-├── skills/ontology/                  # phase 2: everyday modelling for any agent
-└── hooks/                            # phase 2: stop.mjs, pre_tool_use.mjs
+├── src/index.ts                 # card and Skill contributions; build emits ifaces.json
+├── skills/ontology-rsi-toolkit/
+│   ├── SKILL.md                 # Organizer: prepare, train, freeze, test, report
+│   ├── references/              # benchmark, initialization, training, ontologist, evaluation
+│   └── scripts/onto.mjs         # Node built-ins only
+└── test/
 ```
 
-The package does not ship `domain-ontology`. `onto.mjs init` creates it in the Target's State, so that reinstalling the plugin never touches what an agent has learned.
+The card has category `rsi`, so the toolkit appears under **Method** in the Optimize tab. `references/evaluation.md` is byte-identical to the other container-training toolkits. The package ships no domain content; `onto.mjs init` creates `skills/domain-ontology/` in the Target's State.
 
-Inside a training container the main session is the Ontologist. Each attempt runs in a fresh Actor session that sees only the public task and a frozen, provenance-free export of the slot. The default is two passes over the training tasks: pass 2 retries every task under the ontology learned in pass 1, which gives the improved-retry signal for promotion and the last training measurement. The exported checkpoint is the last published version.
+## Evaluation
 
-The card has category `rsi` and `preinstall: false`. Under PRFC-0019, the name and category are enough for the toolkit to appear in the Method dropdown and in the algorithm count on the draft page. No frontend change is needed.
+### Protocol
 
-### Evaluation on GDPevo-essential
+- `penguin-harness-benchmark` at `010fda6b`; `@prismshadow/penguin-cli` 0.2.18 from npm (0.2.19, named in the PR #16 records, is not published).
+- `deepseek-flash` at thinking `max` for every role. The API reports only the alias; as of 2026-11-12 it serves DeepSeek-V4.1-Flash-1017.
+- One training run per group (6 h budget). Three test repetitions of the frozen State, each case in a fresh container.
+- Toolkit commit `4697d39` for all six groups.
+- Baseline: the PR #16 records. A rerun of the Coverage Review baseline on 0.2.18 averaged 56.0 over 12 completed cells against 55.00 published.
 
-The current best average is SkillOpt's 70.25, against a baseline of 56.32.
+### Results
 
-| Group | Baseline | Best so far | Expected fit | Why |
-| --- | --- | --- | --- | --- |
-| Service Ticket Resolution | 48.90 | 69.95 (SkillOpt) | High | Gate order and action preconditions are action contracts; `test-005` is an audit. |
-| Financial Control | 50.96 | 63.89 (SkillAdam) | High | Claim, bill and payment lifecycles; referential integrity |
-| Portfolio Management | 70.16 | 77.40 (SkillOpt) | Low to medium | The bottleneck is arithmetic and route choice, and the policies are already explicit. |
-| Coverage Review | 55.00 | 80.67 (SkillAdam) | High | The baseline scores exactly 55.00 on every case; `basis_audit` asks for source precedence and record order. |
-| Court Clerk Operations | 52.60 | 61.98 (SkillOpt) | Medium | Rules scoped by jurisdiction; every method regresses on case 001. |
-| Engineering Portfolio Analytics | 60.32 | 91.52 (TRACE) | Medium | Good structural fit, but little headroom is left. |
+Test score: mean ± sample std over three repetitions. Train: fresh Actors on the training tasks, before → after the ontology. Rules: deployed policy elements by replication outcome.
 
-All scores are means of three test repetitions, taken from `penguin-harness-benchmark/experiments/gdpevo-essential/` (PR #16).
+| Group | Baseline | Test | Train | Rules (reproduced / held) | Judge calls | Training cost |
+| --- | --- | --- | --- | --- | --- | --- |
+| Coverage Review | 55.00 | 58.33 ± 2.89 | 84.6 → 93.4 | 3 / 6 | 225 | $0.83 |
+| Service Ticket Resolution | 48.90 | 85.10 ± 0.35 | 88.2 → 94.1 | 4 / 5 | 255 | $0.78 |
+| Financial Control | 50.96 | 63.42 ± 0.94 | 73.9 → 92.0 | 4 / 2 | 416 | $0.53 |
+| Court Clerk Operations | 52.60 | 52.21 ± 3.65 | 86.5 → 87.6 | 1 / 0 | 658 | $0.59 |
+| Portfolio Management | 70.16 | 75.07 ± 2.29 | 71.9 → 90.5 | 5 / 9 | 571 | $1.05 |
+| Engineering Portfolio Analytics | 60.32 | 72.55 ± 0.00 | 43.9 → 100 | 10 / 4 | 430 | $1.10 |
+| **Mean** | **56.32** | **67.78 ± 0.60** | | | | **$4.87** |
 
-#### Hypotheses
+- 24 of 30 test cases are at or above their baseline mean.
+- No deployed rule was harmful in replication. Two rules in Engineering Portfolio Analytics were refuted by experiment and never reached an Actor.
+- Court Clerk improved little on training (86.5 → 87.6), and only one rule passed both gates; test stayed at baseline.
 
-The mean score shows whether the toolkit helps. The five hypotheses below show whether it helps for the reason the Motivation gives. Each one has a reference value from PR #16 and a stated consequence if it fails.
-
-| # | Hypothesis | Measure | Reference (PR #16) | If it fails |
-| --- | --- | --- | --- | --- |
-| H1 | Domain knowledge transfers with less loss. | Train − test gap | 14.7–27.8 | Typed knowledge overfits the same way rules do; tighten the lifecycle thresholds. |
-| H2 | Typed knowledge composes. | Gain on case 005 ÷ gain on cases 001–004 | −0.13 (OpenSkill) to 0.57 (TRACE) | Composition is not what types buy; drop the claim. |
-| H3 | Gating limits harm. | Test cases below baseline | 5–10 of 30 | Candidate status does not stop harmful knowledge; gate candidates out of the rendered view. |
-| H4 | Gains follow domain structure. | Gains in Coverage Review, Financial Control and Service Ticket Resolution exceed the gain in Portfolio Management. | — | The gain comes from something other than the model of the domain. |
-| H5 | Types matter. | Typed ontology versus free-text notes under the same loop (ablation) | — | The gain comes from evidence gating alone; ship the loop and drop the types. |
-
-There are 30 test cases and 3 repetitions. Results are reported as per-case paired differences against the baseline, with bootstrap intervals. H2 rests on six composite cases, so it is indicative rather than conclusive.
-
-#### Protocol
-
-- **Configuration**: DeepSeek-V4.1-Flash-1017 with thinking at max, on PenguinHarness 0.2.19. This matches PR #16.
-- **Training**: one container and one session per group, with a 6-hour budget. The five training tasks run in order, and the judge is available. The ontology is refined after each task, and `skill/` is exported at the end.
-- **Test**: `skill/` is frozen. Each case runs in a fresh container with the judge disabled, and the test is repeated three times.
-- **Reported**:
-  - the mean and sample standard deviation, per group and overall;
-  - H1–H5;
-  - training and test cost and tokens;
-  - which elements the Target used, taken from `ontology-used.txt`.
-- **Cost**: about US$11–14 for six trainings and 3 × 30 test runs. A baseline rerun adds about US$7.5, and the H5 ablation about US$12. These are estimated from the existing records at DeepSeek Flash list prices.
-
-The results are submitted as six experiments under `experiments/gdpevo-essential/`, following RFC-0002.
-
-### Awesome RSI classification
-
-`experiment.yaml` records:
-
-```yaml
-dimensions:
-  artifact: [Non-parametric, Context, Memory]
-  mode: [Offline, Online]          # Offline on GDPevo; Online through the phase 2 stop hook
-  topology: [Sequential]
-  selection: [Artifact validation, Instance result]
-  updater: [Teacher]               # the Ontologist runs as a separate role
-  source: [Train/dev set, Environment]
-  feedback: [Score, Non-binary, Non-score, Other]
-  frequency: [Trajectory]
-  scope: [Specialized]
-```
+Run-to-run variance is large. An earlier full run, with a development version of the toolkit, averaged 69.11; per group the two runs differed by up to 21.7 points (Coverage Review: 80.00 vs 58.33). One training run per group, as the benchmark protocol prescribes, is a noisy estimate.
 
 ## Invariants
-[invariants]: #invariants
 
-### Evidence-bound elements
+- Every non-retired element cites a verbatim quote; every active policy element cites a confirming experiment on record.
+- Nothing from a rubric, reference answer or verifier output enters the loop. The only feedback is the training judge's score.
+- Every Actor attempt on the published ontology counts. None is relabelled, dropped or overwritten.
+- Exported training answers are the Actors' own; experiment variants are never submitted.
+- The package contains no domain content.
 
-> Every element that is not `retired` cites at least one quote that appears verbatim in a Trace of the Target.
+## Limitations
 
-Validate enforces this on every publish. Without it, the ontology cannot be audited, and a hallucinating Ontologist can write rules that look like facts.
+- Requires a judge that scores a submitted answer on request. Without one the experiment gate does not apply.
+- Each task type has one training task, so a rule is derived, tested and replicated on the same task. Neither gate can tell a rule about the type from a rule about that task, and nothing stops a rule confirmed in one task from being scoped `global`. This is the main source of the train − test gap.
+- A section scored only as a whole gives no per-field signal.
+- Exploration is a search over the judge. Replication limits what it can deploy; the judge calls are reported per group.
+- `ONTOLOGY.md` adds up to about 6k tokens per task.
 
-### No private scoring material
+## Alternatives
 
-> Nothing taken from a `rubric/`, a gold answer or a verifier's private output enters the refinement loop. The only feedback is what the training judge returns, its score and correctness feedback, which the benchmark exposes for training. The Actor never sees it.
+- **Accept on a higher rerun score** (SkillOpt, SkillAdam): costs agent runs and attributes poorly. The first version did this.
+- **Experiment only:** shows the value is right, not that the rule produces it.
+- **Replication only:** works without a judge, but every wrong rule reaches an agent first.
+- **Free-text notes:** no declared observable, so no experiment.
 
-This is the information barrier that every toolkit keeps (*Self-Improvement › The information barrier*). If it is broken, the test scores mean nothing.
+Delivery:
 
-### Data-free package
+| Option | How | Trade-off |
+| --- | --- | --- |
+| A (current) | Own repository; GitHub Release tarball; entry in `penguin-harness-plugins` | Matches the index; source lives outside Prism-Shadow |
+| B | `penguin-harness/plugins/ontology-rsi-toolkit/` | Next to the other toolkits; needs maintainer agreement |
 
-> The published package contains no domain ontology content. Every element in a learning slot was produced by the loop from that agent's own runs.
-
-This is the separation of algorithm and data that community RFC-0003 asks for. Without it, the toolkit would carry benchmark knowledge, and its scores would not transfer.
-
-## Drawbacks
-[drawbacks]: #drawbacks
-
-- `ONTOLOGY.md` adds up to about 6k tokens of context to every task.
-- Extraction quality depends on the model. Candidate status limits the effect of wrong elements but does not remove them.
-- GDPevo services are read-only, so the benchmark does not measure the `pre_tool_use` contract check.
-- Each group has five training tasks. The support threshold of 2 is a starting value, to be checked in the smoke run.
-- Under delivery option A, the source lives outside the community repositories.
-
-## Rationale and alternatives
-[rationale-and-alternatives]: #rationale-and-alternatives
-
-- **Free-text notes instead of typed elements.** This is what ACE and the Skill-based toolkits do. H5 measures the difference directly.
-- **Selecting each edit on a validation split**, as EvoOntology does. GDPevo has no validation split. SkillOpt uses Train for selection as a declared adaptation, which runs into the saturation described in *Motivation*. Counted support and counterexamples do not need a validation split.
-- **YAML storage.** YAML is easier to read, but hook scripts cannot parse it without a dependency. The rendered `ONTOLOGY.md` covers readability.
-- **Two plugins**: an `rsi` toolkit plus a product plugin for everyday modelling. One package is simpler to install. It can be split if the maintainers want the `rsi` category to hold only algorithm toolkits.
-- **Delivery.**
-
-| Option | How | For | Against |
-| --- | --- | --- | --- |
-| A: independent repository plus index entry (proposed) | Source in the contributor's GitHub repository; a GitHub Release carries the `npm pack` tarball; a `manifest.toml` entry is added to `penguin-harness-plugins` | Matches the index's CONTRIBUTING; the author owns releases | Source outside the community repositories; releases depend on the contributor |
-| B: built-in plugin | PR to `penguin-harness/plugins/ontology-rsi-toolkit/` | Sits with the nine existing toolkits, under core's tests | The quest names `penguin-harness-plugins` as the target; the maintainers must accept a new built-in |
-| C: source directory in `penguin-harness-plugins` | `<plugin-id>/` at the repository root, as community RFC-0003 describes | Matches the RFC text | The harness no longer reads this format, and it conflicts with the index design |
+The package is laid out so that B is a directory move.
 
 ## Prior art
-[prior-art]: #prior-art
 
-| Method | Learned artifact | Retention | Difference |
-| --- | --- | --- | --- |
-| [ACE](https://arxiv.org/abs/2510.04618) | Playbook of itemized rules | Append-only, with helpful and harmful counters | Free text, not tied to entities, no evidence required |
-| [SkillOpt](https://arxiv.org/abs/2605.23904), [TRACE](https://arxiv.org/abs/2608.22793) | Skill or Skill bank | Selection by training score | As above |
-| [EvoOntology](https://arxiv.org/abs/2609.15779) | Ontology layer of a data agent: content, schema, tool interfaces | One edit at a time, compared pairwise on validation tasks | Needs a validation split; no explicit action contracts or lifecycles |
-| [EvoBelief](https://arxiv.org/abs/2610.12789) | Falsifiable world-model rules | Independent validation before use; counterexamples narrow or retire rules | Same lifecycle idea, applied here to a typed business ontology |
-| [TTSE](https://arxiv.org/abs/2609.24289) | Separate FACT and TIP banks | Batch failure attribution; misleading rules retired | Already ablated on GDPevo; its FACT/TIP split is the closest precedent for separating observed structure from inferred policy |
-| [HarnessMM](https://arxiv.org/abs/2610.32813) | Executable decision graphs with guards | Validation selects the configuration | Aims at token cost, not domain modelling |
-
-This comparison is based on the abstracts. The full texts of EvoOntology, EvoBelief and TTSE will be reviewed in P0, and this section will be updated before the PR. [#36](https://github.com/Prism-Shadow/penguin-harness-community/issues/36), the Knowledge Base plugin, covers documents and retrieval; this toolkit covers types and contracts.
-
-## Unresolved questions
-[unresolved-questions]: #unresolved-questions
-
-1. Delivery: option A, B or C?
-2. Should community RFC-0003 be updated to match PRFC-0003 v1.1.0? A revision PR can come with this work.
-3. Evaluation settings:
-   - Which benchmark commit? The baseline ran at `53f779e8` and SkillOpt at `457400e8`, while the current statements pin `010fda6b`.
-   - Which model-name spelling: `DeepSeek-V4.1-Flash-1017` (published records) or `deepseek-flash-1017` (RFC-0002 example)?
-   - Which thinking level: `max` (published records) or `high` (workflow guide)?
-4. Should the PR #16 baseline be reused, or rerun at the chosen commit?
-5. Is `ontology-rsi-toolkit`, in the `rsi` category, the right name and place?
-6. Are the phase 2 hooks in scope for #37, or should they be a separate quest?
-
-## Future possibilities
-[future-possibilities]: #future-possibilities
-
-- **Stage 2.** Typed contracts linked to evidence could act as checks when filtering synthesized trajectories, and as verifiable reward terms for agentic RL. The Stage 2 roadmap names both.
-- **Workbench.** An Ontology Explorer workbench could show the graph and its changelog next to the chat.
-- **Shared ontologies.** One ontology could be shared by the agents of a Project. This relates to penguin-harness#308 (project-level shared Skills).
-- **Writable benchmarks.** A benchmark with writable business services would make the `pre_tool_use` checkpoint measurable.
-
-## Schedule
-[schedule]: #schedule
-
-| Phase | Work | Dates (2026) |
+| Method | How an edit is kept | Difference |
 | --- | --- | --- |
-| P0 | Settle the open questions; read EvoOntology, EvoBelief and TTSE in full | 11/12–11/15 |
-| P1 | Model, scripts, slot, training reference, controller | 11/16–11/23 |
-| P1 | Smoke run on one group (Coverage Review or Financial Control); results posted to #37 | 11/24–11/26 |
-| P1 | Full run on all six groups | 11/27–12/03 |
-| P2 | Hooks and the everyday Skill, in parallel with the full run | 11/30–12/06 |
-| P3 | H5 ablation | 12/04–12/09 |
-| — | PR submitted | 12/07 |
-| — | Claim grace period ends | 12/11 |
+| [ACE](https://arxiv.org/abs/2510.04618) | Reflector's helpful/harmful counters | Credit is a model's opinion of a run |
+| [SkillOpt](https://arxiv.org/abs/2605.23904), SkillAdam | Rerun mean must rise | Credit by whole reruns |
+| [TRACE](https://arxiv.org/abs/2608.22793) | Contrasting trajectories; checkpoint by training score | Credit by trajectory groups |
+| [EvoOntology](https://arxiv.org/abs/2609.15779) | Pairwise comparison on a validation split | Needs a validation split; no action contracts |
+| [EvoBelief](https://arxiv.org/abs/2610.12789) | Validation before use; counterexamples retire rules | Closest in spirit; here the test is an edit to the output |
+| [TTSE](https://arxiv.org/abs/2609.24289) | Batch failure attribution; FACT/TIP banks | Closest precedent for separating structure from policy |
+
+## Open questions
+
+1. Delivery: A or B?
+2. Is penguin-cli 0.2.18 acceptable for a leaderboard entry, given 0.2.19 is not published?
+3. `references/evaluation.md` lists four method names and must stay byte-identical across toolkits. Should it gain `ontology`?
+4. The adapter's startup race on 0.2.18 (a 503 when setting the turn cap; status `config_failed`) hit 4 of 231 trials in these runs. A short retry in `helper.mjs` would remove it.
+5. The plugin index requires an `activate` export, which content-only plugins (all built-in RSI toolkits included) do not have since PRFC-0003 v1.1.0. Should the index accept them?
